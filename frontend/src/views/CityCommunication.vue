@@ -317,6 +317,35 @@ async function getRouteInfo() {
   }
 }
 
+function normalizeTimestamp(value) {
+  if (value === null || value === undefined || value === '') {
+    return new Date().toISOString()
+  }
+
+  if (typeof value === 'number') {
+    if (value > 1e12) {
+      return new Date(value).toISOString()
+    }
+    if (value > 1e9) {
+      return new Date(value * 1000).toISOString()
+    }
+    return new Date().toISOString()
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value)
+    if (!Number.isNaN(parsed)) {
+      return new Date(parsed).toISOString()
+    }
+    const numeric = Number(value)
+    if (!Number.isNaN(numeric)) {
+      return normalizeTimestamp(numeric)
+    }
+  }
+
+  return new Date().toISOString()
+}
+
 // 添加加密消息详情
 function addEncryptedMessage(from, to, original, huffmanEncoded, aesEncrypted, timestamp, type, aesDecrypted = '', huffmanCodes = {}) {
   console.log(`[addEncryptedMessage] 参数检查:`)
@@ -425,11 +454,13 @@ function addEncryptedMessage(from, to, original, huffmanEncoded, aesEncrypted, t
     messageType = 'encrypted-colored'
   }
   
+  const normalizedTimestamp = normalizeTimestamp(timestamp)
+
   const messageObj = {
     from: type === 'sender' ? selectedCity.value : from,
     message: messageContent,
     messageType: messageType, // 'text' 或 'encrypted-colored'
-    timestamp,
+    timestamp: normalizedTimestamp,
     isOwn,
     isEncrypted: true,
     id: Date.now() + Math.random()
@@ -449,10 +480,11 @@ function addEncryptedMessage(from, to, original, huffmanEncoded, aesEncrypted, t
 
 // 添加消息到聊天记录
 function addMessage(from, message, timestamp, isOwn = false) {
+  const normalizedTimestamp = normalizeTimestamp(timestamp)
   messages.value.push({
     from,
     message,
-    timestamp,
+    timestamp: normalizedTimestamp,
     isOwn,
     id: Date.now() + Math.random()
   })
@@ -468,10 +500,11 @@ function addMessage(from, message, timestamp, isOwn = false) {
 
 // 添加系统消息
 function addSystemMessage(message) {
+  const timestamp = normalizeTimestamp()
   messages.value.push({
     from: '系统',
     message,
-    timestamp: new Date().toISOString(),
+    timestamp,
     isSystem: true,
     id: Date.now() + Math.random()
   })
@@ -479,7 +512,11 @@ function addSystemMessage(message) {
 
 // 格式化时间
 function formatTime(timestamp) {
-  return new Date(timestamp).toLocaleTimeString('zh-CN', {
+  const parsed = Date.parse(timestamp)
+  if (Number.isNaN(parsed)) {
+    return '--:--'
+  }
+  return new Date(parsed).toLocaleTimeString('zh-CN', {
     hour: '2-digit',
     minute: '2-digit'
   })

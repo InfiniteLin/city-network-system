@@ -3,7 +3,7 @@
  * 封装监控页面的核心业务逻辑
  */
 
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { apiService } from '../services/api.service'
 import { WebSocketManager, WS_STATUS } from '../services/websocket.service'
 import { loadAmapJs, createMap, createCityMarker, createPolyline } from '../services/map.service'
@@ -35,6 +35,16 @@ export function useMonitor() {
   })
   
   const statAnimationTrigger = ref(0)
+
+  const filteredMessages = computed(() => {
+    if (filterType.value === 'encrypted') {
+      return recentMessages.value.filter(msg => msg.type === 'encrypted')
+    }
+    if (filterType.value === 'normal') {
+      return recentMessages.value.filter(msg => msg.type === 'normal')
+    }
+    return recentMessages.value
+  })
   
   // WebSocket 管理
   let wsManager = null
@@ -434,6 +444,7 @@ export function useMonitor() {
     cities,
     onlineCities,
     recentMessages,
+    filteredMessages,
     statistics,
     selectedCity,
     isAnimationPaused,

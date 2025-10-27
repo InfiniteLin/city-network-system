@@ -319,6 +319,12 @@ function isEdgeHighlighted(e) {
 // render edge weight label position
 function midPoint(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } }
 
+function displayWeight(v, i, j) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return i === j ? 0 : infinitySymbol.value
+  return n
+}
+
 // Actions
 function renderTopology() {
   showTopology.value = true
@@ -441,19 +447,6 @@ function renderTopology() {
     </div>
   </div>
 </template>
-
-<script>
-// helper for template weight display (avoid Infinity literal)
-export default {
-  methods: {
-    displayWeight(v, i, j) {
-      const n = Number(v)
-      if (!Number.isFinite(n)) return i === j ? 0 : this.infinitySymbol
-      return n
-    }
-  }
-}
-</script>
 
 <style scoped>
 .page { display: grid; gap: 16px; }

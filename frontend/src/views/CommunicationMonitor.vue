@@ -480,6 +480,18 @@ function startMonitoring() {
   }, 500)
 }
 
+function updateOnlineCities(nextCities) {
+  const normalized = Array.from(new Set(
+    (nextCities || [])
+      .map(name => (typeof name === 'string' ? name.trim() : ''))
+      .filter(name => name && name !== 'Monitor_Admin')
+  ))
+
+  onlineCities.value = normalized
+  statistics.value.onlineCitiesCount = normalized.length
+  updateCityMarkers()
+}
+
 // 刷新在线城市
 async function refreshOnlineCities() {
   try {
@@ -495,13 +507,7 @@ async function refreshOnlineCities() {
     
     if (response.ok) {
       const data = await response.json()
-      // 过滤掉 Monitor_Admin
-      const cities = (data.cities || []).filter(city => city !== 'Monitor_Admin')
-      onlineCities.value = cities
-      statistics.value.onlineCitiesCount = cities.length
-      
-      // 更新城市节点状态
-      updateCityMarkers()
+  updateOnlineCities(data.cities || [])
     } else {
       console.warn('⚠️ 刷新在线城市失败，HTTP状态:', response.status)
     }
@@ -594,6 +600,7 @@ function connectMonitorWebSocket() {
         // 处理系统消息
         else if (data.type === 'system') {
           console.log('[监控] 系统消息:', data.message)
+          handleSystemMessage(data.message)
         }
       } catch (error) {
         console.error('[监控] 解析消息失败:', error)
@@ -639,6 +646,28 @@ function manualReconnect() {
   reconnectAttempts = 0  // 重置重连次数
   errorMsg.value = ''
   connectMonitorWebSocket()
+}
+
+function handleSystemMessage(message) {
+  if (!message) return
+
+  const joinMatch = message.match(/^(.+?) 已加入城市通讯网络/)
+  if (joinMatch) {
+    const cityName = joinMatch[1].trim()
+    if (cityName && cityName !== 'Monitor_Admin' && !onlineCities.value.includes(cityName)) {
+      updateOnlineCities([...onlineCities.value, cityName])
+    }
+    return
+  }
+
+  const leaveMatch = message.match(/^(.+?) (?:已离开城市通讯网络|断开连接|退出城市通讯网络)/)
+  if (leaveMatch) {
+    const cityName = leaveMatch[1].trim()
+    if (cityName) {
+      updateOnlineCities(onlineCities.value.filter(name => name !== cityName))
+    }
+    return
+  }
 }
 
 // 添加消息记录
