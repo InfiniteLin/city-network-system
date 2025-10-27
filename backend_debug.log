@@ -1,0 +1,52 @@
+[244777.77] [WebSocket] ========== 新连接请求 ==========
+[244777.77] [WebSocket] 城市: Monitor_Admin
+[244777.77] [WebSocket] 当前连接数: 0
+[244777.77] [connect] WebSocket 已接受，城市: Monitor_Admin
+[244777.77] [connect] 城市 Monitor_Admin 连接成功，当前活跃连接: 1
+[244777.77] [connect] 活跃城市列表: ['Monitor_Admin']
+[244777.77] [connect] Monitor_Admin 连接，跳过广播
+[244777.77] [WebSocket] ✅ 城市 Monitor_Admin 连接成功
+[244784.80] [WebSocket] ========== 新连接请求 ==========
+[244784.81] [WebSocket] 城市: 北京
+[244784.81] [WebSocket] 当前连接数: 1
+[244784.81] [connect] WebSocket 已接受，城市: 北京
+[244784.81] [connect] 城市 北京 连接成功，当前活跃连接: 2
+[244784.81] [connect] 活跃城市列表: ['Monitor_Admin', '北京']
+[244784.81] [WebSocket] ✅ 城市 北京 连接成功
+[244788.67] [WebSocket] ========== 新连接请求 ==========
+[244788.67] [WebSocket] 城市: 上海
+[244788.67] [WebSocket] 当前连接数: 2
+[244788.67] [connect] WebSocket 已接受，城市: 上海
+[244788.67] [connect] 城市 上海 连接成功，当前活跃连接: 3
+[244788.67] [connect] 活跃城市列表: ['Monitor_Admin', '北京', '上海']
+[244788.67] [WebSocket] ✅ 城市 上海 连接成功
+[244860.45] [WebSocket] 📨 来自 北京 的消息: type=message
+[244901.41] [WebSocket] 🔌 Monitor_Admin WebSocket在消息循环中断开
+[244901.41] [WebSocket] 🔌 城市 Monitor_Admin 正常断开连接
+[244901.41] [disconnect] 断开城市 Monitor_Admin 的连接
+[244901.41] [disconnect] 从 active_connections 移除 Monitor_Admin
+[244901.41] [disconnect] 从 city_connections 移除 Monitor_Admin 的一个连接
+[244901.41] [disconnect] 清空 Monitor_Admin 的 city_connections
+[244901.41] [disconnect] 断开完成，剩余活跃连接: 2
+[244901.41] [disconnect] 剩余城市列表: ['北京', '上海']
+[244901.41] [WebSocket] 城市 Monitor_Admin 连接处理结束，当前连接数: 2
+[244901.41] [WebSocket] 🔌 上海 WebSocket在消息循环中断开
+[244901.41] [WebSocket] 🔌 城市 上海 正常断开连接
+[244901.41] [disconnect] 断开城市 上海 的连接
+[244901.41] [disconnect] 从 active_connections 移除 上海
+[244901.41] [disconnect] 从 city_connections 移除 上海 的一个连接
+[244901.41] [disconnect] 清空 上海 的 city_connections
+[244901.41] [disconnect] 断开完成，剩余活跃连接: 1
+[244901.41] [disconnect] 剩余城市列表: ['北京']
+[244901.41] [broadcast_message] 发送到 北京 失败: sent 1012 (service restart); no close frame received
+[244901.41] [broadcast_message] 北京 发送失败但不确定是否断开，保留连接
+[244901.41] [WebSocket] 城市 上海 连接处理结束，当前连接数: 1
+[244901.41] [WebSocket] 🔌 北京 WebSocket在消息循环中断开
+[244901.41] [WebSocket] 🔌 城市 北京 正常断开连接
+[244901.41] [disconnect] 断开城市 北京 的连接
+[244901.41] [disconnect] 从 active_connections 移除 北京
+[244901.41] [disconnect] 从 city_connections 移除 北京 的一个连接
+[244901.41] [disconnect] 清空 北京 的 city_connections
+[244901.41] [disconnect] 断开完成，剩余活跃连接: 0
+[244901.41] [disconnect] 剩余城市列表: []
+[244901.41] [WebSocket] 城市 北京 连接处理结束，当前连接数: 0

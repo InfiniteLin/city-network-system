@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>测试拓扑数据加载</title>
+</head>
+<body>
+    <h1>测试拓扑数据加载</h1>
+    <div id="result"></div>
+    
+    <script>
+        async function testTopology() {
+            const resultDiv = document.getElementById('result');
+            
+            try {
+                // 等待5秒让前端加载数据
+                resultDiv.innerHTML = '<p>等待5秒让前端加载数据...</p>';
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                
+                // 检查后端
+                const response = await fetch('http://localhost:8000/topology/status');
+                const data = await response.json();
+                
+                resultDiv.innerHTML = `
+                    <h2>后端拓扑状态：</h2>
+                    <p>城市数量: ${data.cities_count || 0}</p>
+                    <p>边数量: ${data.edges_count || 0}</p>
+                    <p>MST边数量: ${data.mst_edges_count || 0}</p>
+                    <h3>城市列表：</h3>
+                    <ul>${(data.cities || []).map(c => `<li>${c}</li>`).join('')}</ul>
+                    
+                    <h2>localStorage 数据：</h2>
+                    <p>城市: ${localStorage.getItem('cities') ? JSON.parse(localStorage.getItem('cities')).length : 0} 个</p>
+                    <p>边: ${localStorage.getItem('edges') ? JSON.parse(localStorage.getItem('edges')).length : 0} 条</p>
+                `;
+                
+                if (data.edges_count === 0) {
+                    resultDiv.innerHTML += '<h3 style="color: red;">❌ 警告: 边数据为空！</h3>';
+                } else {
+                    resultDiv.innerHTML += `<h3 style="color: green;">✅ 边数据已加载: ${data.edges_count} 条边</h3>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<p style="color: red;">错误: ${error.message}</p>`;
+            }
+        }
+        
+        // 页面加载后执行测试
+        window.onload = testTopology;
+    </script>
+</body>
+</html>
