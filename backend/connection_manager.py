@@ -7,7 +7,7 @@ import asyncio
 from typing import Dict, List
 from fastapi import WebSocket
 from routing import routing_manager
-from crypto import crypto_manager
+from crypto import crypto_manager, HuffmanEncoder
 import sys
 from pathlib import Path
 
@@ -15,12 +15,14 @@ from pathlib import Path
 DEBUG_LOG_FILE = Path(__file__).parent.parent / "backend_debug.log"
 
 def debug_log(message: str):
-    """写入调试日志"""
+    """写入调试日志（非阻塞）"""
     try:
-        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+        import sys
+        # 只写文件，不输出到 stderr（避免阻塞）
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8", buffering=1) as f:  # 行缓冲
             f.write(f"[{asyncio.get_event_loop().time():.2f}] {message}\n")
-        print(message, file=sys.stderr)  # 同时输出到stderr
-    except:
+    except Exception:
+        # 静默失败，不影响主流程
         pass
 
 
@@ -59,12 +61,10 @@ class ConnectionManager:
         debug_log(f"[connect] 城市 {city} 连接成功，当前活跃连接: {len(self.active_connections)}")
         debug_log(f"[connect] 活跃城市列表: {list(self.active_connections.keys())}")
         
-        # 通知其他城市有新连接（Monitor_Admin 不广播）
+        # ⚠️ 移除 broadcast_system_message 调用避免潜在死锁
+        # 改为只记录日志
         if city != "Monitor_Admin":
-            try:
-                await self.broadcast_system_message(f"{city} 已加入城市通讯网络")
-            except Exception as e:
-                debug_log(f"[connect] 广播新连接消息失败，但不影响连接: {e}")
+            debug_log(f"[connect] 🌐 {city} 已加入城市通讯网络")
         else:
             debug_log(f"[connect] Monitor_Admin 连接，跳过广播")
 
@@ -93,7 +93,15 @@ class ConnectionManager:
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
         """发送个人消息"""
-        await websocket.send_text(message)
+        try:
+            await asyncio.wait_for(
+                websocket.send_text(message),
+                timeout=1.0
+            )
+        except asyncio.TimeoutError:
+            debug_log(f"[send_personal_message] 发送超时")
+        except Exception as e:
+            debug_log(f"[send_personal_message] 发送失败: {e}")
 
     async def broadcast_message(self, message: dict):
         """广播消息给所有连接的客户端"""
@@ -101,7 +109,14 @@ class ConnectionManager:
         disconnected_cities = []
         for city, websocket in list(self.active_connections.items()):
             try:
-                await websocket.send_text(json.dumps(message))
+                # 添加超时保护，避免阻塞
+                await asyncio.wait_for(
+                    websocket.send_text(json.dumps(message)),
+                    timeout=0.5  # 500ms 超时
+                )
+            except asyncio.TimeoutError:
+                debug_log(f"[broadcast_message] 发送到 {city} 超时")
+                disconnected_cities.append((city, websocket))
             except Exception as e:
                 # 连接已断开，记录需要移除的城市
                 error_msg = str(e)
@@ -121,27 +136,35 @@ class ConnectionManager:
     
     async def send_encrypted_message(self, from_city: str, to_city: str, message: str):
         """发送加密消息，按照MST路由传递"""
+        import time
+        start_time = time.time()
+        
         try:
             debug_log(f"\n=== send_encrypted_message 被调用 ===")
             debug_log(f"发送方: {from_city}, 接收方: {to_city}, 消息: {message[:50]}...")
             
             # 1. 检查拓扑是否已加载
+            step_start = time.time()
             if not routing_manager.cities or len(routing_manager.cities) == 0:
                 error_msg = f"拓扑数据未加载，无法发送加密消息。请先在'城市地图'页面上传拓扑数据。"
-                debug_log(f"ERROR: {error_msg}")
+                debug_log(f"ERROR: 拓扑数据未加载，无法发送加密消息。请先在'城市地图'页面上传拓扑数据。")
                 # 直接向发送者发送错误通知（按 city 名查找 websocket）
                 try:
                     if from_city in self.active_connections:
-                        await self.active_connections[from_city].send_text(json.dumps({
-                            "type": "error",
-                            "message": error_msg
-                        }))
+                        await asyncio.wait_for(
+                            self.active_connections[from_city].send_text(json.dumps({
+                                "type": "error",
+                                "message": error_msg
+                            })),
+                            timeout=0.5
+                        )
                 except Exception as _:
                     debug_log(f"WARN: 向 {from_city} 发送拓扑未加载错误失败")
                 return  # 返回而不是抛出异常
             
             # 2. 获取路由路径
             route = routing_manager.get_all_cities_in_route(from_city, to_city)
+            debug_log(f"⏱️ 计算路由耗时: {(time.time() - step_start) * 1000:.2f}ms")
             debug_log(f"计算得到的路由: {route}")
             debug_log(f"当前活跃连接: {list(self.active_connections.keys())}")
             
@@ -150,25 +173,32 @@ class ConnectionManager:
                 debug_log(f"ERROR: {error_msg}")
                 try:
                     if from_city in self.active_connections:
-                        await self.active_connections[from_city].send_text(json.dumps({
-                            "type": "error",
-                            "message": error_msg
-                        }))
+                        await asyncio.wait_for(
+                            self.active_connections[from_city].send_text(json.dumps({
+                                "type": "error",
+                                "message": error_msg
+                            })),
+                            timeout=0.5
+                        )
                 except Exception:
                     debug_log(f"WARN: 向 {from_city} 发送找不到路径错误失败")
                 return  # 返回而不是抛出异常
             
-            # 2. 建立共享密钥
+            # 2. 建立共享密钥（异步操作，不阻塞事件循环）
+            step_start = time.time()
             try:
-                shared_key = crypto_manager.establish_shared_key(from_city, to_city)
+                shared_key = await crypto_manager.establish_shared_key(from_city, to_city)
+                debug_log(f"⏱️ 建立共享密钥耗时: {(time.time() - step_start) * 1000:.2f}ms")
                 debug_log(f"共享密钥建立成功")
             except Exception as e:
                 debug_log(f"ERROR: 建立共享密钥失败: {e}")
                 raise
             
-            # 3. 加密消息
+            # 3. 加密消息（异步操作，不阻塞事件循环）
+            step_start = time.time()
             try:
-                encrypted_data, huffman_encoded, huffman_codes = crypto_manager.encrypt_message(message, shared_key)
+                encrypted_data, huffman_encoded, huffman_codes = await crypto_manager.encrypt_message(message, shared_key)
+                debug_log(f"⏱️ 加密消息耗时: {(time.time() - step_start) * 1000:.2f}ms")
                 
                 debug_log(f"加密结果:")
                 debug_log(f"  encrypted_data type: {type(encrypted_data)}, len: {len(str(encrypted_data))}")
@@ -209,12 +239,20 @@ class ConnectionManager:
             success_count = 0
             
             for city in route:
+                debug_log(f"  [循环] 处理城市: {city}")
                 if city in self.active_connections:
                     try:
-                        debug_log(f"  发送给: {city}")
-                        await self.active_connections[city].send_text(message_json)
+                        debug_log(f"  发送给: {city} - 准备发送")
+                        # 添加超时保护，避免 WebSocket send_text 阻塞
+                        await asyncio.wait_for(
+                            self.active_connections[city].send_text(message_json),
+                            timeout=1.0  # 1秒超时
+                        )
                         success_count += 1
-                        debug_log(f"  ✅ 发送成功")
+                        debug_log(f"  ✅ 发送成功: {city}")
+                    except asyncio.TimeoutError:
+                        debug_log(f"  ❌ 发送超时: {city}")
+                        failed_cities.append((city, self.active_connections[city]))
                     except Exception as e:
                         error_msg = str(e)
                         debug_log(f"  ❌ 发送失败: {error_msg}")
@@ -228,20 +266,29 @@ class ConnectionManager:
                 else:
                     debug_log(f"  ⚠️ {city} 不在活跃连接中")
             
+            debug_log(f"[退出循环] 准备移除断开的连接")
             # 移除确认断开的连接
             for city, websocket in failed_cities:
                 self.disconnect(city, websocket)
             
             debug_log(f"发送完成: 成功 {success_count}/{len(route)} 个城市")
+            debug_log(f"[发送完成后] 准备发送给 Monitor_Admin")
 
             
             # 特别发送给监控管理员（即使不在路由中）
             # 监控管理员的失败不应该影响系统运行
             if 'Monitor_Admin' in self.active_connections and 'Monitor_Admin' not in route:
+                debug_log(f"  [Monitor_Admin] 准备发送")
                 try:
                     debug_log(f"  发送给监控管理员: Monitor_Admin")
-                    await self.active_connections['Monitor_Admin'].send_text(message_json)
+                    # 添加超时保护，避免 WebSocket send_text 阻塞
+                    await asyncio.wait_for(
+                        self.active_connections['Monitor_Admin'].send_text(message_json),
+                        timeout=0.5  # 500ms 超时
+                    )
                     debug_log(f"  ✅ 监控管理员接收成功")
+                except asyncio.TimeoutError:
+                    debug_log(f"  ❌ 监控管理员接收超时")
                 except Exception as e:
                     error_msg = str(e)
                     debug_log(f"  ❌ 监控管理员接收失败: {error_msg}")
@@ -252,13 +299,20 @@ class ConnectionManager:
                             self.disconnect('Monitor_Admin', self.active_connections.get('Monitor_Admin'))
                         except:
                             pass
+            else:
+                debug_log(f"  [Monitor_Admin] 跳过 (不在连接中或已在路由中)")
             
-            # 6. 发送系统通知（即使失败也不影响主流程）
-            try:
-                await self.broadcast_system_message(f"{from_city} 发送加密消息给 {to_city}，路径: {' -> '.join(route)}")
-            except Exception as e:
-                debug_log(f"⚠️ 广播系统消息失败: {e}")
+            debug_log(f"[Monitor_Admin 处理完成] 准备记录日志")
             
+            # ⚠️ 移除 broadcast_system_message 调用，因为它会导致死锁：
+            # 当在 WebSocket 消息循环内调用 send_encrypted_message 时，
+            # 该 WebSocket 正在等待函数返回，无法接收广播消息，导致阻塞
+            # 改为只记录日志
+            debug_log(f"📤 {from_city} -> {to_city}: 路径 {' -> '.join(route)}")
+            
+            debug_log(f"[记录完成] 准备计算总耗时")
+            total_time = (time.time() - start_time) * 1000
+            debug_log(f"⏱️ 总耗时: {total_time:.2f}ms")
             debug_log(f"=== send_encrypted_message 完成 ===\n")
             
         except Exception as e:
@@ -266,17 +320,18 @@ class ConnectionManager:
             error_details = traceback.format_exc()
             debug_log(f"ERROR in send_encrypted_message: {e}")
             debug_log(error_details)
-            try:
-                await self.broadcast_system_message(f"发送消息失败: {str(e)}")
-            except:
-                pass
+            # ⚠️ 移除 broadcast_system_message 避免死锁
+            debug_log(f"❌ 发送消息失败: {str(e)}")
             # 不重新抛出异常，改为记录并尝试通知发送者（如果可用），避免顶层断开或崩溃
             try:
                 if 'from_city' in locals() and from_city in self.active_connections:
-                    await self.active_connections[from_city].send_text(json.dumps({
-                        "type": "error",
-                        "message": f"发送消息失败: {str(e)}"
-                    }))
+                    await asyncio.wait_for(
+                        self.active_connections[from_city].send_text(json.dumps({
+                            "type": "error",
+                            "message": f"发送消息失败: {str(e)}"
+                        })),
+                        timeout=0.5
+                    )
             except Exception:
                 debug_log("WARN: 无法向发送者发送失败通知")
             return
@@ -301,7 +356,8 @@ class ConnectionManager:
                 shared_key = crypto_manager.get_shared_key(from_city, to_city)
                 if not shared_key:
                     debug_log(f"[decrypt_and_deliver_message] 无法获取共享密钥")
-                    await self.broadcast_system_message(f"无法获取 {from_city} 和 {to_city} 的共享密钥")
+                    # ⚠️ 移除 broadcast_system_message 调用避免死锁
+                    debug_log(f"[decrypt_and_deliver_message] ❌ 无法获取 {from_city} 和 {to_city} 的共享密钥")
                     return
                 
                 # 解密消息（返回两个步骤的结果）
@@ -312,8 +368,8 @@ class ConnectionManager:
                 encrypted_data_bytes = base64.b64decode(encrypted_data.encode())
                 huffman_decoded_step = fernet.decrypt(encrypted_data_bytes).decode()
                 
-                # 第二步：哈夫曼解码
-                decrypted_message = crypto_manager.huffman.decode(huffman_decoded_step, huffman_codes)
+                # 第二步：哈夫曼解码（使用局部 HuffmanEncoder 实例，避免竞争）
+                decrypted_message = HuffmanEncoder().decode(huffman_decoded_step, huffman_codes)
                 
                 debug_log(f"[decrypt_and_deliver_message] 解密成功: {decrypted_message[:30]}...")
                 
@@ -330,12 +386,16 @@ class ConnectionManager:
                         "final_message": decrypted_message,          # 最终解密的消息
                         "timestamp": encrypted_message["timestamp"]
                     }
-                    await self.active_connections[to_city].send_text(json.dumps(decrypted_msg))
+                    try:
+                        await asyncio.wait_for(
+                            self.active_connections[to_city].send_text(json.dumps(decrypted_msg)),
+                            timeout=1.0
+                        )
+                    except asyncio.TimeoutError:
+                        debug_log(f"[decrypt_and_deliver_message] 发送给 {to_city} 超时")
                 
-                try:
-                    await self.broadcast_system_message(f"{to_city} 成功接收来自 {from_city} 的加密消息")
-                except:
-                    pass
+                # ⚠️ 移除 broadcast_system_message 调用避免死锁
+                debug_log(f"[decrypt_and_deliver_message] ✅ {to_city} 成功接收来自 {from_city} 的加密消息")
             else:
                 # 中间节点需要继续转发消息到下一个节点
                 current_index = route.index(current_city) if current_city in route else -1
@@ -343,19 +403,21 @@ class ConnectionManager:
                     # 还有更多节点要经过，继续转发
                     next_city = route[current_index + 1]
                     if next_city in self.active_connections:
-                        await self.active_connections[next_city].send_text(json.dumps(encrypted_message))
-                    try:
-                        await self.broadcast_system_message(f"{current_city} 转发消息从 {from_city} 到 {to_city} (下一个: {next_city})")
-                    except:
-                        pass
+                        try:
+                            await asyncio.wait_for(
+                                self.active_connections[next_city].send_text(json.dumps(encrypted_message)),
+                                timeout=1.0
+                            )
+                        except asyncio.TimeoutError:
+                            debug_log(f"[decrypt_and_deliver_message] 转发到 {next_city} 超时")
+                    # ⚠️ 移除 broadcast_system_message 调用避免死锁
+                    debug_log(f"[decrypt_and_deliver_message] 📡 {current_city} 转发消息 {from_city} -> {to_city} (下一跳: {next_city})")
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            try:
-                await self.broadcast_system_message(f"解密消息失败: {str(e)}")
-            except:
-                pass
+            # ⚠️ 移除 broadcast_system_message 调用避免死锁
+            debug_log(f"[decrypt_and_deliver_message] ❌ 解密消息失败: {str(e)}")
 
     async def broadcast_system_message(self, message: str):
         """广播系统消息"""

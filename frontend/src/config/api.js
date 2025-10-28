@@ -30,9 +30,9 @@ export const API_ENDPOINTS = {
  * 请求配置
  */
 export const REQUEST_CONFIG = {
-  TIMEOUT: 5000,
-  RETRY_ATTEMPTS: 3,
-  RETRY_DELAY: 1000
+  TIMEOUT: 10000, // 增加到10秒
+  RETRY_ATTEMPTS: 2, // 减少重试次数，避免过度重试
+  RETRY_DELAY: 500 // 减少重试延迟
 }
 
 export default {

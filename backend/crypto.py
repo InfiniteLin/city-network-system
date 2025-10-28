@@ -6,6 +6,8 @@ import hashlib
 import hmac
 import secrets
 import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Tuple, Optional
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -14,6 +16,10 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import base64
 import heapq
 from collections import Counter
+
+# 线程池用于CPU密集型操作
+# 增加 max_workers 以支持更多并发加密请求
+_executor = ThreadPoolExecutor(max_workers=16)
 
 
 class HuffmanEncoder:
@@ -103,7 +109,8 @@ class CryptoManager:
     """加密管理器"""
     
     def __init__(self):
-        self.huffman = HuffmanEncoder()
+        # 不在此保留共享的 HuffmanEncoder 实例，避免多线程/并发时的可变状态冲突
+        # 每次编码/解码都创建独立实例
         self.shared_secrets = {}  # 存储城市间的共享密钥
     
     def generate_key(self) -> bytes:
@@ -124,10 +131,11 @@ class CryptoManager:
         key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
         return key
     
-    def encrypt_message(self, message: str, key: bytes) -> Tuple[str, str, Dict[str, str]]:
-        """加密消息：AES加密 + 哈夫曼编码"""
-        # 1. 哈夫曼编码
-        huffman_encoded, huffman_codes = self.huffman.encode(message)
+    def _encrypt_message_sync(self, message: str, key: bytes) -> Tuple[str, str, Dict[str, str]]:
+        """加密消息同步实现（在线程池中运行）"""
+        # 1. 哈夫曼编码：为避免并发时共享可变状态导致的问题，使用独立的编码器实例
+        encoder = HuffmanEncoder()
+        huffman_encoded, huffman_codes = encoder.encode(message)
         
         # 2. AES加密
         fernet = Fernet(key)
@@ -135,6 +143,12 @@ class CryptoManager:
         encrypted_b64 = base64.b64encode(encrypted_data).decode()
         
         return encrypted_b64, huffman_encoded, huffman_codes
+    
+    async def encrypt_message(self, message: str, key: bytes) -> Tuple[str, str, Dict[str, str]]:
+        """加密消息：AES加密 + 哈夫曼编码（异步版本）"""
+        loop = asyncio.get_event_loop()
+        # 在线程池中运行，避免长消息的哈夫曼编码阻塞事件循环
+        return await loop.run_in_executor(_executor, self._encrypt_message_sync, message, key)
     
     def decrypt_message(self, encrypted_b64: str, key: bytes, huffman_codes: Dict[str, str]) -> str:
         """解密消息：哈夫曼解码 + AES解密"""
@@ -145,14 +159,16 @@ class CryptoManager:
             huffman_encoded = fernet.decrypt(encrypted_data).decode()
             
             # 2. 哈夫曼解码
-            message = self.huffman.decode(huffman_encoded, huffman_codes)
+            # 使用本地 HuffmanEncoder 实例进行解码，避免依赖共享实例状态
+            decoder = HuffmanEncoder()
+            message = decoder.decode(huffman_encoded, huffman_codes)
             
             return message
         except Exception as e:
             raise ValueError(f"解密失败: {str(e)}")
     
-    def key_exchange(self, city1: str, city2: str) -> Tuple[bytes, bytes]:
-        """密钥协商：Diffie-Hellman风格的密钥交换"""
+    def _key_exchange_sync(self, city1: str, city2: str) -> Tuple[bytes, bytes]:
+        """密钥协商同步实现（在线程池中运行）"""
         # 生成随机数作为私钥
         private_key1 = secrets.randbits(256)
         private_key2 = secrets.randbits(256)
@@ -161,7 +177,7 @@ class CryptoManager:
         p = 2**256 - 189  # 大质数
         g = 2  # 生成元
         
-        # 计算公钥
+        # 计算公钥（CPU密集型操作）
         public_key1 = pow(g, private_key1, p)
         public_key2 = pow(g, private_key2, p)
         
@@ -179,6 +195,12 @@ class CryptoManager:
         
         return key1, key2
     
+    async def key_exchange(self, city1: str, city2: str) -> Tuple[bytes, bytes]:
+        """密钥协商：Diffie-Hellman风格的密钥交换（异步版本）"""
+        loop = asyncio.get_event_loop()
+        # 在线程池中运行CPU密集型操作，避免阻塞事件循环
+        return await loop.run_in_executor(_executor, self._key_exchange_sync, city1, city2)
+    
     def _derive_fernet_key(self, shared_key: int) -> bytes:
         """从共享密钥派生Fernet密钥"""
         key_bytes = shared_key.to_bytes(32, 'big')
@@ -189,12 +211,13 @@ class CryptoManager:
         key_pair = f"{city1}-{city2}" if city1 < city2 else f"{city2}-{city1}"
         return self.shared_secrets.get(key_pair)
     
-    def establish_shared_key(self, city1: str, city2: str) -> bytes:
-        """建立两个城市间的共享密钥"""
-        if self.get_shared_key(city1, city2):
-            return self.get_shared_key(city1, city2)
+    async def establish_shared_key(self, city1: str, city2: str) -> bytes:
+        """建立两个城市间的共享密钥（异步版本）"""
+        existing_key = self.get_shared_key(city1, city2)
+        if existing_key:
+            return existing_key
         
-        key1, key2 = self.key_exchange(city1, city2)
+        key1, key2 = await self.key_exchange(city1, city2)
         return key1
 
 

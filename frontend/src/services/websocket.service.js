@@ -28,6 +28,12 @@ export class WebSocketManager {
     this.reconnectTimer = null
     this.isManualClose = false
     
+    // 心跳机制
+    this.heartbeatInterval = null
+    this.heartbeatTimeout = null
+    this.pingInterval = 30000  // 每30秒发送一次ping
+    this.pongTimeout = 10000   // 等待pong响应的超时时间
+    
     // 事件处理器
     this.handlers = {
       onOpen: options.onOpen || (() => {}),
@@ -61,12 +67,20 @@ export class WebSocketManager {
         console.log(`✅ [WebSocket] ${this.city} 连接成功`)
         this.reconnectAttempts = 0
         this.setStatus(WS_STATUS.CONNECTED)
+        this.startHeartbeat()  // 启动心跳
         this.handlers.onOpen(event)
       }
       
       this.ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
+          
+          // 处理心跳响应
+          if (data.type === 'pong') {
+            this.handlePong()
+            return
+          }
+          
           this.handlers.onMessage(data, event)
         } catch (error) {
           console.error(`[WebSocket] ${this.city} 解析消息失败:`, error)
@@ -75,6 +89,7 @@ export class WebSocketManager {
       
       this.ws.onclose = (event) => {
         console.log(`[WebSocket] ${this.city} 连接关闭, code: ${event.code}`)
+        this.stopHeartbeat()  // 停止心跳
         this.setStatus(WS_STATUS.DISCONNECTED)
         this.handlers.onClose(event)
         
@@ -96,6 +111,60 @@ export class WebSocketManager {
     } catch (error) {
       console.error(`❌ [WebSocket] ${this.city} 创建连接失败:`, error)
       this.setStatus(WS_STATUS.ERROR)
+    }
+  }
+
+  /**
+   * 启动心跳
+   */
+  startHeartbeat() {
+    this.stopHeartbeat()  // 先清理旧的定时器
+    
+    this.heartbeatInterval = setInterval(() => {
+      if (this.isConnected()) {
+        this.sendPing()
+      }
+    }, this.pingInterval)
+    
+    console.log(`[WebSocket] ${this.city} 心跳已启动，间隔: ${this.pingInterval}ms`)
+  }
+
+  /**
+   * 停止心跳
+   */
+  stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval)
+      this.heartbeatInterval = null
+    }
+    if (this.heartbeatTimeout) {
+      clearTimeout(this.heartbeatTimeout)
+      this.heartbeatTimeout = null
+    }
+  }
+
+  /**
+   * 发送ping消息
+   */
+  sendPing() {
+    console.log(`[WebSocket] ${this.city} 发送 ping`)
+    this.send({ type: 'ping', timestamp: Date.now() })
+    
+    // 设置pong超时
+    this.heartbeatTimeout = setTimeout(() => {
+      console.warn(`[WebSocket] ${this.city} pong 响应超时，主动关闭连接`)
+      this.ws.close()  // 关闭连接，触发重连
+    }, this.pongTimeout)
+  }
+
+  /**
+   * 处理pong响应
+   */
+  handlePong() {
+    console.log(`[WebSocket] ${this.city} 收到 pong`)
+    if (this.heartbeatTimeout) {
+      clearTimeout(this.heartbeatTimeout)
+      this.heartbeatTimeout = null
     }
   }
 
@@ -144,6 +213,8 @@ export class WebSocketManager {
    * 清理资源
    */
   cleanup() {
+    this.stopHeartbeat()  // 停止心跳
+    
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null

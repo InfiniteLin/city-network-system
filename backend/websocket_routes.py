@@ -3,6 +3,7 @@ WebSocket路由处理
 处理城市通讯的WebSocket连接和消息
 """
 import json
+import asyncio
 from fastapi import WebSocket, WebSocketDisconnect
 from connection_manager import manager, debug_log
 
@@ -24,6 +25,20 @@ async def websocket_endpoint(websocket: WebSocket, city: str):
                 message_data = json.loads(data)
                 debug_log(f"[WebSocket] 📨 来自 {city} 的消息: type={message_data.get('type')}")
                 
+                # 处理心跳 ping 消息
+                if message_data.get("type") == "ping":
+                    # 立即响应 pong
+                    pong_msg = {"type": "pong", "timestamp": message_data.get("timestamp")}
+                    try:
+                        await asyncio.wait_for(
+                            websocket.send_text(json.dumps(pong_msg)),
+                            timeout=1.0
+                        )
+                        debug_log(f"[WebSocket] 💓 响应 pong 到 {city}")
+                    except Exception as e:
+                        debug_log(f"[WebSocket] ⚠️ 发送 pong 失败: {e}")
+                    continue
+                
                 if message_data.get("type") == "message":
                     # 广播消息给所有连接的客户端
                     await manager.broadcast_message(message_data)
@@ -31,7 +46,7 @@ async def websocket_endpoint(websocket: WebSocket, city: str):
                     # 处理加密消息
                     await manager.decrypt_and_deliver_message(message_data, city)
                 elif message_data.get("type") == "send_encrypted":
-                    # 发送加密消息
+                    # 发送加密消息 - 使用后台任务，立即返回避免阻塞
                     debug_log(f"[WebSocket] 🔐 处理send_encrypted消息")
                     to_city = message_data.get("to")
                     message = message_data.get("message")
@@ -44,22 +59,9 @@ async def websocket_endpoint(websocket: WebSocket, city: str):
                         debug_log(f"[WebSocket] ⚠️ 缺少消息内容")
                         continue
                     
-                    try:
-                        await manager.send_encrypted_message(city, to_city, message)
-                        debug_log(f"[WebSocket] ✅ 加密消息处理完成")
-                    except Exception as e:
-                        debug_log(f"[WebSocket] ❌ 发送加密消息失败: {e}")
-                        import traceback
-                        debug_log(traceback.format_exc())
-                        # 向发送者通知失败
-                        try:
-                            error_msg = {
-                                "type": "error",
-                                "message": f"发送失败: {str(e)}"
-                            }
-                            await websocket.send_text(json.dumps(error_msg))
-                        except:
-                            pass
+                    # 创建后台任务处理加密消息，不等待完成
+                    asyncio.create_task(manager.send_encrypted_message(city, to_city, message))
+                    debug_log(f"[WebSocket] ✅ 已创建后台任务处理加密消息")
                 
             except json.JSONDecodeError as e:
                 debug_log(f"[WebSocket] ⚠️ JSON解析失败 from {city}: {e}")
@@ -91,12 +93,9 @@ async def websocket_endpoint(websocket: WebSocket, city: str):
     except WebSocketDisconnect:
         debug_log(f"[WebSocket] 🔌 城市 {city} 正常断开连接")
         manager.disconnect(city, websocket)
-        # 通知其他城市有连接断开（Monitor_Admin 不广播）
+        # ⚠️ 移除 broadcast_system_message 调用避免死锁
         if city != "Monitor_Admin":
-            try:
-                await manager.broadcast_system_message(f"{city} 已离开城市通讯网络")
-            except Exception as e:
-                debug_log(f"[WebSocket] 广播断开消息失败，但不影响流程: {e}")
+            debug_log(f"[WebSocket] 🔌 {city} 已离开城市通讯网络")
     except Exception as e:
         debug_log(f"[WebSocket] ❌ 城市 {city} 发生异常: {e}")
         import traceback

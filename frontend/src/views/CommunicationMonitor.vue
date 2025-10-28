@@ -1,17 +1,23 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
+import MapStatsPanel from '../components/MapStatsPanel.vue'
+import OnlineCitiesList from '../components/OnlineCitiesList.vue'
+import MessageStreamList from '../components/MessageStreamList.vue'
+import MapManager from '../services/mapManager.service'
+import MessageAnimator from '../services/messageAnimation.service'
+import useMonitorWebSocket from '../composables/useMonitorWebSocket'
+import useTopology from '../composables/useTopology'
+import apiService from '../services/api.service'
 
-// 高德地图配置
-const AMAP_KEY = 'f0d1e40d79a2157f20c4b3cb5fc43579'
-
-// 状态管理
+// UI 状态
 const mapEl = ref(null)
-const mapInstance = ref(null)
-const cityMarkers = ref({})
-const mstLines = ref([])
-const messageAnimations = ref([])
-const cities = ref([])
-const edges = ref([])
+const selectedCity = ref(null)
+const isAnimationPaused = ref(false)
+const filterType = ref('all') // 'all', 'encrypted', 'normal'
+const isLoading = ref(false)
+const errorMsg = ref('')
+
+// 数据状态
 const onlineCities = ref([])
 const recentMessages = ref([])
 const statistics = ref({
@@ -19,162 +25,80 @@ const statistics = ref({
   encryptedMessages: 0,
   normalMessages: 0,
   onlineCitiesCount: 0,
-  totalCitiesCount: 0  // 拓扑中定义的城市总数
+  totalCitiesCount: 0
 })
-const selectedCity = ref(null)
-const isAnimationPaused = ref(false)
-const filterType = ref('all') // 'all', 'encrypted', 'normal'
-const isLoading = ref(false)
-const errorMsg = ref('')
-const wsStatus = ref('disconnected')  // 'connecting', 'connected', 'disconnected', 'error'
+const statAnimationTrigger = ref(0)
 
-// WebSocket 连接（监控所有城市）
-let monitorWs = null
+// 服务实例
+let mapManager = null
+let messageAnimator = null
 let refreshTimer = null
-let isComponentMounted = false  // 标记组件是否挂载
-let reconnectAttempts = 0  // 重连次数
-const MAX_RECONNECT_ATTEMPTS = 5  // 最大重连次数
-let reconnectTimer = null  // 重连定时器
+let isComponentMounted = false
+let isRefreshing = false // 添加刷新锁，防止并发请求
+let consecutiveErrors = 0 // 连续错误计数
 
-// 加载高德地图JS
-function loadAmapJs() {
-  return new Promise((resolve, reject) => {
-    // 如果已经加载，直接返回
-    if (window.AMap) {
-      console.log('✅ 高德地图 API 已加载')
-      return resolve()
-    }
-    
-    // 检查是否正在加载
-    if (document.querySelector('script[src*="webapi.amap.com"]')) {
-      console.log('⏳ 高德地图 API 正在加载中，等待完成...')
-      // 等待加载完成
-      const checkInterval = setInterval(() => {
-        if (window.AMap) {
-          clearInterval(checkInterval)
-          console.log('✅ 高德地图 API 加载完成')
-          resolve()
-        }
-      }, 100)
-      
-      // 超时处理
-      setTimeout(() => {
-        clearInterval(checkInterval)
-        if (!window.AMap) {
-          reject(new Error('高德地图加载超时'))
-        }
-      }, 10000)
-      return
-    }
-    
-    console.log('📥 开始加载高德地图 API...')
-    const script = document.createElement('script')
-    script.src = `https://webapi.amap.com/maps?v=1.4.15&key=${AMAP_KEY}&plugin=AMap.Scale,AMap.ToolBar`
-    script.async = true
-    script.onload = () => {
-      console.log('✅ 高德地图 API 加载成功')
-      resolve()
-    }
-    script.onerror = (e) => {
-      console.error('❌ 高德地图 API 加载失败:', e)
-      reject(new Error('高德地图 API 加载失败，请检查网络连接'))
-    }
-    document.head.appendChild(script)
-  })
-}
-
-// 检查后端健康状态
-async function checkBackendHealth() {
-  try {
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 3000)
-    
-    const response = await fetch('http://localhost:8001/health', {
-      signal: controller.signal
-    })
-    
-    clearTimeout(timeoutId)
-    
-    if (response.ok) {
-      console.log('✅ 后端服务正常')
-      return true
-    } else {
-      console.warn('⚠️ 后端服务响应异常:', response.status)
-      return false
-    }
-  } catch (error) {
-    console.error('❌ 后端服务不可访问:', error)
-    return false
+// 使用组合式函数
+const { cities, edges, loadTopology } = useTopology()
+const { wsStatus, connect: connectWebSocket, disconnect: disconnectWebSocket, manualReconnect } = useMonitorWebSocket({
+  onMessage: handleWebSocketMessage,
+  onConnected: () => {
+    errorMsg.value = ''
+  },
+  onError: (error) => {
+    errorMsg.value = error
   }
-}
+})
 
-// 加载地图
+/**
+ * 初始化地图
+ */
 async function initMap() {
   try {
     isLoading.value = true
     errorMsg.value = ''
     
-    // 检查后端是否可访问
-    const backendHealthy = await checkBackendHealth()
-    if (!backendHealthy) {
+    // 检查后端健康状态
+    const healthCheck = await apiService.checkHealth()
+    if (!healthCheck.success) {
       errorMsg.value = '后端服务不可访问，请确保后端服务已启动（http://localhost:8001）'
-      console.warn('⚠️ 后端服务不可访问，将继续加载地图但功能可能受限')
+      console.warn('⚠️ 后端服务不可访问')
     }
     
-    console.log('🗺️ 开始加载高德地图...')
-    await loadAmapJs()
+    // 初始化地图管理器
+    mapManager = new MapManager()
+    await mapManager.initMap(mapEl.value)
     
-    if (!mapEl.value) {
-      console.error('❌ 地图容器未找到')
-      errorMsg.value = '地图容器未找到'
-      isLoading.value = false
-      return
-    }
-
-    // 等待DOM准备好
-    await new Promise(resolve => setTimeout(resolve, 300))
-
-    console.log('🗺️ 初始化地图实例...')
-    mapInstance.value = new window.AMap.Map(mapEl.value, {
-      zoom: 5,
-      center: [108.5525, 34.3227],
-      viewMode: '2D',
-      mapStyle: 'amap://styles/blue'
-    })
-
-    console.log('✅ 地图初始化成功')
-
-    // 等待并尝试加载拓扑数据（给拓扑加载一个最大等待时间，避免长时间阻塞）
-    const TOPOLOGY_TIMEOUT_MS = 5000
-    let topologyLoaded = false
+    // 加载拓扑数据
     try {
-      await Promise.race([
-        loadTopologyData(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('拓扑加载超时')), TOPOLOGY_TIMEOUT_MS))
-      ])
-      topologyLoaded = true
+      await loadTopology()
       console.log('📡 拓扑数据加载完成')
     } catch (err) {
-      // 超时或失败的情况：保留已从 localStorage 读取的数据（如果有），并提示日志
       console.warn('⚠️ 拓扑数据加载失败或超时:', err)
     }
-
-    // 根据是否有城市数据来决定后续渲染
+    
+    // 初始化消息动画器（传入MST边数据）
+    messageAnimator = new MessageAnimator(mapManager.getMapInstance(), edges.value)
+    // 构建MST图
+    messageAnimator.setEdges(edges.value, cities.value)
+    
+    // 绘制城市和连接
     if (cities.value.length > 0) {
       console.log('🎨 开始绘制城市和连接...')
-      drawCitiesAndMST()
+      mapManager.drawCities(cities.value, (city) => {
+        selectedCity.value = city
+      })
+      mapManager.drawMSTLines(cities.value, edges.value)
     } else {
       console.warn('⚠️ 没有城市数据，请先访问"城市地图"页面')
       errorMsg.value = '没有城市数据，请先访问"城市地图"页面加载数据'
     }
-
-    // 更新统计的拓扑城市总数（用于在界面上显示）
+    
+    // 更新统计
     statistics.value.totalCitiesCount = cities.value.length
-
-    // 确保在地图和初次拓扑尝试完成后再隐藏加载遮罩
+    
     isLoading.value = false
-
-    // 启动监控（在拓扑尝试后启动，以减少竞态情况）
+    
+    // 启动监控
     startMonitoring()
     
   } catch (error) {
@@ -184,302 +108,75 @@ async function initMap() {
   }
 }
 
-// 加载拓扑数据
-async function loadTopologyData() {
-  // 先尝试从 localStorage 加载城市数据
-  const citiesData = localStorage.getItem('cities')
-  
-  if (citiesData) {
-    try {
-      cities.value = JSON.parse(citiesData)
-      console.log('✅ 从 localStorage 加载城市数据:', cities.value.length, '个城市')
-    } catch (e) {
-      console.error('解析 localStorage 城市数据失败:', e)
-      cities.value = []
-    }
-  } else {
-    console.warn('⚠️ localStorage 中没有城市数据')
-  }
-
-  // 从后端获取拓扑状态（包括 MST 边）- 使用超时控制
-  try {
-    console.log('📡 正在获取后端拓扑状态...')
-    
-    // 创建一个带超时的 fetch 请求（3秒超时）
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 3000)
-    
-    const response = await fetch('http://localhost:8001/topology/status', {
-      signal: controller.signal
-    })
-    
-    clearTimeout(timeoutId)
-    
-    if (response.ok) {
-      const data = await response.json()
-      console.log('📡 拓扑状态:', data)
-      
-      // ========== 关键修复：总是确保后端有拓扑数据 ==========
-      // 检查后端是否有足够的拓扑数据
-      const backendHasTopology = data.cities > 0 && data.mst_edges_count > 0
-      
-      if (!backendHasTopology) {
-        console.warn('⚠️ 后端没有拓扑数据，尝试从本地加载并发送')
-        // 尝试从 localStorage 加载并发送到后端
-        const localEdgesText = localStorage.getItem('edges')
-        if (cities.value.length > 0 && localEdgesText) {
-          try {
-            const localEdges = JSON.parse(localEdgesText)
-            if (Array.isArray(localEdges) && localEdges.length > 0) {
-              console.log(`📤 发送本地拓扑到后端: ${cities.value.length} 城市, ${localEdges.length} 边`)
-              const postResp = await fetch('http://localhost:8001/topology', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cities: cities.value, edges: localEdges })
-              })
-              
-              if (postResp.ok) {
-                const postData = await postResp.json()
-                console.log('✅ 拓扑数据已发送到后端:', postData)
-                
-                // 重新获取拓扑状态
-                const resp2 = await fetch('http://localhost:8001/topology/status')
-                if (resp2.ok) {
-                  const data2 = await resp2.json()
-                  if (data2.mst_edges && Array.isArray(data2.mst_edges) && data2.mst_edges.length > 0) {
-                    edges.value = data2.mst_edges
-                    console.log(`✅ 后端返回 MST 边: ${edges.value.length} 条`)
-                  }
-                }
-              } else {
-                console.error('❌ 发送拓扑到后端失败:', postResp.status)
-              }
-            }
-          } catch (e) {
-            console.error('❌ 处理本地拓扑数据失败:', e)
-          }
-        } else {
-          console.warn('⚠️ 本地也没有拓扑数据，请先访问"城市地图"页面加载数据')
-        }
-      } else {
-        // 后端有拓扑数据，直接使用
-        console.log('✅ 后端已有拓扑数据')
-      }
-      
-      // ========== 加载 MST 边数据 ==========
-      // 如果 localStorage 中没有城市数据，且后端有城市名称列表，可以尝试构建基本数据
-      if (cities.value.length === 0 && data.city_names && data.city_names.length > 0) {
-        console.log('⚠️ 尝试从后端城市名称构建数据，但缺少经纬度信息')
-        console.log('请先访问"城市地图"页面加载完整数据')
-      }
-      
-      // 使用后端计算的 MST 边（只显示最小生成树）
-      if (data.mst_edges && Array.isArray(data.mst_edges) && data.mst_edges.length > 0) {
-        edges.value = data.mst_edges
-        console.log('✅ 加载 MST 边:', edges.value.length, '条（最小生成树）')
-      } else {
-        console.warn('⚠️ 后端未返回 MST 边数据')
-        console.log('保留现有边数据:', edges.value.length, '条')
-      }
-    } else {
-      console.warn('⚠️ 获取拓扑状态失败，HTTP 状态:', response.status)
-      // 不清空edges，保留现有数据
-      console.log('保留现有边数据:', edges.value.length, '条')
-    }
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('⚠️ 获取拓扑状态超时（3秒），保留现有拓扑数据')
-    } else {
-      console.error('❌ 获取拓扑状态失败:', error)
-    }
-    // 即使后端失败，保留现有的边数据
-    console.log('保留现有边数据:', edges.value.length, '条')
-  }
-  // 更新统计的拓扑城市总数（如果存在城市数据）
-  statistics.value.totalCitiesCount = cities.value.length
-  return true
-}
-
-// 绘制城市和MST连接
-function drawCitiesAndMST() {
-  if (!mapInstance.value) {
-    console.error('❌ 地图实例不存在，无法绘制')
-    return
-  }
-  
-  if (!window.AMap) {
-    console.error('❌ AMap API 未加载，无法绘制')
-    return
-  }
-  
-  if (cities.value.length === 0) {
-    console.warn('⚠️ 没有城市数据，跳过绘制')
-    return
-  }
-
-  console.log(`🎨 开始绘制 ${cities.value.length} 个城市...`)
-  
-  // 绘制城市节点
-  cities.value.forEach(city => {
-    try {
-      const marker = new window.AMap.Marker({
-        position: new window.AMap.LngLat(Number(city.lng), Number(city.lat)),
-        title: city.name,
-        content: createCityMarkerContent(city.name, false)
-        // 不使用 offset，让 CSS transform 来处理定位
-      })
-
-      marker.on('click', () => {
-        selectedCity.value = city
-        showCityInfo(city)
-      })
-
-      marker.setMap(mapInstance.value)
-      cityMarkers.value[city.name] = marker
-    } catch (e) {
-      console.error(`❌ 绘制城市 ${city.name} 失败:`, e)
-    }
-  })
-  
-  console.log(`✅ 成功绘制 ${Object.keys(cityMarkers.value).length} 个城市标记`)
-
-  // 绘制MST连线
-  drawMSTLines()
-}
-
-// 创建城市标记内容
-function createCityMarkerContent(cityName, isOnline) {
-  const color = isOnline ? '#22c55e' : '#94a3b8'
-  const pulseClass = isOnline ? 'pulse-marker' : ''
-  return `
-    <div style="
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      transform: translate(-50%, -100%);
-    ">
-      <div class="${pulseClass}" style="
-        width: 16px;
-        height: 16px;
-        background: ${color};
-        border: 2px solid white;
-        border-radius: 50%;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.4);
-        margin-bottom: 4px;
-      "></div>
-      <div style="
-        background: white;
-        padding: 2px 6px;
-        border-radius: 3px;
-        font-size: 11px;
-        font-weight: 600;
-        color: #334155;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.2);
-        white-space: nowrap;
-      ">${cityName}</div>
-    </div>
-  `
-}
-
-// 绘制MST连线
-function drawMSTLines() {
-  console.log('🔵 drawMSTLines 被调用', {
-    edges数量: edges.value?.length || 0,
-    cities数量: cities.value?.length || 0,
-    hasAMap: !!window.AMap,
-    hasMapInstance: !!mapInstance.value
-  })
-
-  if (!window.AMap || !mapInstance.value) {
-    console.warn('⚠️ 地图未初始化，跳过绘制')
-    return
-  }
-
-  if (!edges.value || edges.value.length === 0) {
-    console.warn('⚠️ 没有边数据，跳过绘制')
-    return
-  }
-
-  console.log(`🎨 开始绘制 ${edges.value.length} 条 MST 边`)
-
-  // 清除旧的MST线条（只在有新线条要绘制时才清除）
-  if (mstLines.value && mstLines.value.length > 0) {
-    console.log(`🧹 清除旧的 ${mstLines.value.length} 条线条`)
-    mstLines.value.forEach(line => {
-      if (line && line.setMap) {
-        try {
-          line.setMap(null)
-        } catch (e) {
-          console.warn('清除线条失败:', e)
-        }
-      }
-    })
-  }
-  mstLines.value = []
-
-  // 绘制新线条
-  let successCount = 0
-  edges.value.forEach((edge, index) => {
-    const city1 = cities.value[edge.u]
-    const city2 = cities.value[edge.v]
-    
-    if (!city1 || !city2) {
-      console.warn(`⚠️ 边 ${index} 的城市索引无效: u=${edge.u}, v=${edge.v}`)
-      return
-    }
-
-    if (!city1.lng || !city1.lat || !city2.lng || !city2.lat) {
-      console.warn(`⚠️ 城市坐标缺失: ${city1.name}(${city1.lng},${city1.lat}) -> ${city2.name}(${city2.lng},${city2.lat})`)
-      return
-    }
-
-    try {
-      const line = new window.AMap.Polyline({
-        path: [
-          new window.AMap.LngLat(Number(city1.lng), Number(city1.lat)),
-          new window.AMap.LngLat(Number(city2.lng), Number(city2.lat))
-        ],
-        strokeColor: '#0ea5e9',
-        strokeWeight: 2,
-        strokeOpacity: 0.6,
-        strokeStyle: 'solid',
-        zIndex: 10
-      })
-      
-      line.setMap(mapInstance.value)
-      mstLines.value.push(line)
-      successCount++
-    } catch (e) {
-      console.error(`❌ 绘制 ${city1.name} -> ${city2.name} 连线失败:`, e)
-    }
-  })
-  
-  console.log(`✅ 成功绘制 ${successCount}/${edges.value.length} 条 MST 线条，总计 ${mstLines.value.length} 条线在地图上`)
-}
-
-// 显示城市信息
-function showCityInfo(city) {
-  console.log('选中城市:', city)
-}
-
-// 开始监控
+/**
+ * 启动监控
+ */
 function startMonitoring() {
   // 立即刷新一次在线城市
   refreshOnlineCities()
   
-  // 定时刷新在线城市（增加间隔到3秒，减少请求频率）
-  refreshTimer = setInterval(async () => {
-    await refreshOnlineCities()
-  }, 3000)
+  // 定时刷新在线城市（增加到5秒，减少请求频率）
+  refreshTimer = setInterval(() => {
+    refreshOnlineCities()
+  }, 5000)
 
-  // 延迟建立 WebSocket 监听（等待地图和数据加载完成，避免阻塞）
+  // 延迟建立 WebSocket 连接
   setTimeout(() => {
     if (isComponentMounted) {
-      connectMonitorWebSocket()
+      connectWebSocket()
     }
   }, 500)
 }
 
+/**
+ * 刷新在线城市列表（优化版，带防抖和错误处理）
+ */
+async function refreshOnlineCities() {
+  // 如果正在刷新，跳过本次请求
+  if (isRefreshing) {
+    console.log('[监控] 跳过重复的刷新请求')
+    return
+  }
+  
+  // 如果连续错误过多，暂停刷新
+  if (consecutiveErrors >= 3) {
+    console.warn('[监控] 连续错误过多，暂停自动刷新')
+    if (refreshTimer) {
+      clearInterval(refreshTimer)
+      refreshTimer = null
+    }
+    errorMsg.value = '无法连接到后端服务，请检查后端是否运行'
+    return
+  }
+  
+  isRefreshing = true
+  
+  try {
+    const result = await apiService.getOnlineCities()
+    
+    if (result.success) {
+      updateOnlineCities(result.cities || [])
+      consecutiveErrors = 0 // 成功后重置错误计数
+    } else {
+      console.warn('⚠️ 刷新在线城市失败')
+      consecutiveErrors++
+    }
+  } catch (error) {
+    consecutiveErrors++
+    // 只在第一次错误时打印详细日志，避免刷屏
+    if (consecutiveErrors === 1) {
+      console.error('❌ 刷新在线城市失败:', error.message)
+    } else {
+      console.warn(`⚠️ 刷新失败 (${consecutiveErrors}/3)`)
+    }
+  } finally {
+    isRefreshing = false
+  }
+}
+
+/**
+ * 更新在线城市
+ */
 function updateOnlineCities(nextCities) {
   const normalized = Array.from(new Set(
     (nextCities || [])
@@ -489,165 +186,51 @@ function updateOnlineCities(nextCities) {
 
   onlineCities.value = normalized
   statistics.value.onlineCitiesCount = normalized.length
-  updateCityMarkers()
-}
-
-// 刷新在线城市
-async function refreshOnlineCities() {
-  try {
-    // 添加超时控制（5秒）
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 5000)
-    
-    const response = await fetch('http://localhost:8001/cities', {
-      signal: controller.signal
-    })
-    
-    clearTimeout(timeoutId)
-    
-    if (response.ok) {
-      const data = await response.json()
-  updateOnlineCities(data.cities || [])
-    } else {
-      console.warn('⚠️ 刷新在线城市失败，HTTP状态:', response.status)
-    }
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('⚠️ 刷新在线城市超时（5秒）')
-    } else {
-      console.error('❌ 刷新在线城市失败:', error)
-    }
-    // 超时或失败不清空现有数据，避免界面闪烁
+  
+  // 更新地图标记
+  if (mapManager) {
+    mapManager.updateCityMarkers(cities.value, normalized)
   }
 }
 
-// 更新城市标记状态
-function updateCityMarkers() {
-  cities.value.forEach(city => {
-    const marker = cityMarkers.value[city.name]
-    if (marker) {
-      const isOnline = onlineCities.value.includes(city.name)
-      marker.setContent(createCityMarkerContent(city.name, isOnline))
+/**
+ * 处理 WebSocket 消息
+ */
+function handleWebSocketMessage(data) {
+  console.log('[监控] 收到消息:', data)
+  
+  // 处理普通消息
+  if (data.type === 'message') {
+    console.log('[监控] 处理普通消息')
+    const messageRecord = {
+      from: data.from,
+      to: '全体',
+      content: data.message,
+      type: 'normal'
     }
-  })
-}
-
-// 连接监控 WebSocket（管理员监听所有消息）
-function connectMonitorWebSocket() {
-  // 如果组件已卸载，不要连接
-  if (!isComponentMounted) {
-    console.log('[监控] 组件未挂载，跳过 WebSocket 连接')
-    return
+    addMessageRecord(messageRecord)
   }
-
-  // 清理现有连接
-  if (monitorWs) {
-    monitorWs.onclose = null  // 移除关闭处理器，避免触发重连
-    monitorWs.onerror = null
-    monitorWs.onmessage = null
-    if (monitorWs.readyState === WebSocket.OPEN || monitorWs.readyState === WebSocket.CONNECTING) {
-      monitorWs.close()
+  // 处理加密消息
+  else if (data.type === 'encrypted_message') {
+    console.log('[监控] 处理加密消息:', data.from, '→', data.to)
+    const messageRecord = {
+      from: data.from,
+      to: data.to,
+      content: data.original_message || '加密消息',
+      type: 'encrypted'
     }
-    monitorWs = null
+    addMessageRecord(messageRecord)
   }
-
-  // 清理重连定时器
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
-
-  try {
-    const wsUrl = `ws://localhost:8001/ws/Monitor_Admin`
-    console.log('[监控] 尝试连接 WebSocket:', wsUrl)
-    wsStatus.value = 'connecting'
-    monitorWs = new WebSocket(wsUrl)
-    
-    monitorWs.onopen = () => {
-      console.log('✅ [监控] WebSocket 连接成功建立')
-      reconnectAttempts = 0  // 重置重连次数
-      errorMsg.value = ''  // 清除错误消息
-      wsStatus.value = 'connected'
-    }
-    
-    monitorWs.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data)
-        console.log('[监控] 收到消息:', data)
-        
-        // 处理普通消息
-        if (data.type === 'message') {
-          console.log('[监控] 处理普通消息')
-          const messageRecord = {
-            from: data.from,
-            to: '全体',
-            content: data.message,
-            type: 'normal'
-          }
-          addMessageRecord(messageRecord)
-        }
-        // 处理加密消息
-        else if (data.type === 'encrypted_message') {
-          console.log('[监控] 处理加密消息:', data.from, '→', data.to)
-          const messageRecord = {
-            from: data.from,
-            to: data.to,
-            content: data.original_message || '加密消息',
-            type: 'encrypted'
-          }
-          addMessageRecord(messageRecord)
-        }
-        // 处理系统消息
-        else if (data.type === 'system') {
-          console.log('[监控] 系统消息:', data.message)
-          handleSystemMessage(data.message)
-        }
-      } catch (error) {
-        console.error('[监控] 解析消息失败:', error)
-      }
-    }
-    
-    monitorWs.onclose = (event) => {
-      console.log('[监控] WebSocket 连接已关闭, code:', event.code, 'reason:', event.reason)
-      wsStatus.value = 'disconnected'
-      
-      // 只有在组件仍然挂载且未达到最大重连次数时才重连
-      if (isComponentMounted && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        reconnectAttempts++
-        const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 10000)  // 指数退避，最多10秒
-        console.log(`[监控] 将在 ${delay}ms 后尝试第 ${reconnectAttempts} 次重连...`)
-        
-        reconnectTimer = setTimeout(() => {
-          if (isComponentMounted) {
-            connectMonitorWebSocket()
-          }
-        }, delay)
-      } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.warn('[监控] ⚠️ 已达到最大重连次数，停止重连')
-        errorMsg.value = 'WebSocket 连接失败，请检查后端服务是否运行'
-        wsStatus.value = 'error'
-      }
-    }
-    
-    monitorWs.onerror = (error) => {
-      console.error('❌ [监控] WebSocket 错误:', error)
-      wsStatus.value = 'error'
-    }
-  } catch (error) {
-    console.error('❌ [监控] 创建 WebSocket 连接失败:', error)
-    errorMsg.value = 'WebSocket 连接创建失败'
-    wsStatus.value = 'error'
+  // 处理系统消息
+  else if (data.type === 'system') {
+    console.log('[监控] 系统消息:', data.message)
+    handleSystemMessage(data.message)
   }
 }
 
-// 手动重连 WebSocket
-function manualReconnect() {
-  console.log('[监控] 手动重连...')
-  reconnectAttempts = 0  // 重置重连次数
-  errorMsg.value = ''
-  connectMonitorWebSocket()
-}
-
+/**
+ * 处理系统消息
+ */
 function handleSystemMessage(message) {
   if (!message) return
 
@@ -670,7 +253,9 @@ function handleSystemMessage(message) {
   }
 }
 
-// 添加消息记录
+/**
+ * 添加消息记录
+ */
 function addMessageRecord(message) {
   console.log('[监控] 添加消息记录:', message)
   
@@ -678,7 +263,7 @@ function addMessageRecord(message) {
     id: Date.now(),
     ...message,
     timestamp: new Date().toLocaleTimeString(),
-    isNew: true  // 标记为新消息
+    isNew: true
   })
 
   // 0.5秒后移除新消息标记
@@ -694,8 +279,7 @@ function addMessageRecord(message) {
     recentMessages.value = recentMessages.value.slice(0, 50)
   }
 
-  // 更新统计（带动画触发）
-  const oldTotal = statistics.value.totalMessages
+  // 更新统计
   statistics.value.totalMessages++
   if (message.type === 'encrypted') {
     statistics.value.encryptedMessages++
@@ -703,20 +287,19 @@ function addMessageRecord(message) {
     statistics.value.normalMessages++
   }
   
-  // 触发数字变化动画
-  triggerStatAnimation()
+  // 触发统计动画
+  statAnimationTrigger.value++
 
   // 在地图上显示消息动画
-  console.log('[监控] 检查是否显示动画 - 暂停状态:', isAnimationPaused.value, '过滤结果:', shouldShowMessage(message))
-  if (!isAnimationPaused.value && shouldShowMessage(message)) {
+  if (!isAnimationPaused.value && shouldShowMessage(message) && messageAnimator) {
     console.log('[监控] 触发消息动画')
-    animateMessage(message)
-  } else {
-    console.log('[监控] 动画被跳过')
+    messageAnimator.animateMessage(message, cities.value, onlineCities.value)
   }
 }
 
-// 判断是否应该显示消息
+/**
+ * 判断是否应该显示消息
+ */
 function shouldShowMessage(message) {
   if (filterType.value === 'all') return true
   if (filterType.value === 'encrypted') return message.type === 'encrypted'
@@ -724,276 +307,19 @@ function shouldShowMessage(message) {
   return true
 }
 
-// 消息动画
-function animateMessage(message) {
-  if (!window.AMap || !mapInstance.value) {
-    console.log('[动画] 地图未准备好，跳过动画')
-    return
+/**
+ * 选择城市
+ */
+function handleCitySelect(cityName) {
+  const city = cities.value.find(c => c.name === cityName)
+  if (city) {
+    selectedCity.value = city
   }
-  
-  const fromCity = cities.value.find(c => c.name === message.from)
-  if (!fromCity) {
-    console.log('[动画] 找不到发送城市:', message.from)
-    return
-  }
-
-  // 如果是广播消息（to: '全体'），向所有在线城市发送动画
-  if (message.to === '全体') {
-    console.log('[动画] 广播消息动画:', message.from, '→ 全体，在线城市数:', onlineCities.value.length)
-    const targetCities = onlineCities.value.filter(cityName => 
-      cityName !== message.from && cityName !== 'Monitor_Admin'
-    )
-    console.log('[动画] 目标城市:', targetCities)
-    
-    targetCities.forEach(cityName => {
-      const toCity = cities.value.find(c => c.name === cityName)
-      if (toCity) {
-        createMessageAnimation(fromCity, toCity, message.type)
-      } else {
-        console.log('[动画] 在线城市找不到坐标:', cityName)
-      }
-    })
-    return
-  }
-
-  // 点对点消息
-  const toCity = cities.value.find(c => c.name === message.to)
-  if (!toCity) {
-    console.log('[动画] 找不到接收城市:', message.to)
-    return
-  }
-
-  console.log('[动画] 点对点消息动画:', message.from, '→', message.to)
-  createMessageAnimation(fromCity, toCity, message.type)
 }
 
-// 创建单个消息动画
-function createMessageAnimation(fromCity, toCity, messageType) {
-  if (!window.AMap || !mapInstance.value) return
-
-  const color = messageType === 'encrypted' ? '#8b5cf6' : '#0ea5e9'
-  const glowColor = messageType === 'encrypted' ? 'rgba(139, 92, 246, 0.4)' : 'rgba(14, 165, 233, 0.4)'
-  
-  // 创建动态闪烁的路径线条
-  const messageLine = new window.AMap.Polyline({
-    path: [
-      new window.AMap.LngLat(Number(fromCity.lng), Number(fromCity.lat)),
-      new window.AMap.LngLat(Number(toCity.lng), Number(toCity.lat))
-    ],
-    strokeColor: color,
-    strokeWeight: 4,
-    strokeOpacity: 0.8,
-    strokeStyle: 'solid',
-    zIndex: 100
-  })
-  
-  messageLine.setMap(mapInstance.value)
-  
-  // 创建发光背景线条
-  const glowLine = new window.AMap.Polyline({
-    path: [
-      new window.AMap.LngLat(Number(fromCity.lng), Number(fromCity.lat)),
-      new window.AMap.LngLat(Number(toCity.lng), Number(toCity.lat))
-    ],
-    strokeColor: color,
-    strokeWeight: 12,
-    strokeOpacity: 0.3,
-    strokeStyle: 'solid',
-    zIndex: 99
-  })
-  
-  glowLine.setMap(mapInstance.value)
-  
-  // 创建多个粒子效果（3个粒子）
-  const particles = []
-  const particleCount = 3
-  const particleDelay = 150 // 粒子间隔延迟
-  
-  for (let i = 0; i < particleCount; i++) {
-    setTimeout(() => {
-      createParticle(fromCity, toCity, color, glowColor, i, particleCount)
-    }, i * particleDelay)
-  }
-  
-  // 路径闪烁动画
-  let lineOpacity = 0.8
-  let lineDirection = -1
-  const lineInterval = setInterval(() => {
-    lineOpacity += lineDirection * 0.1
-    if (lineOpacity <= 0.3) {
-      lineOpacity = 0.3
-      lineDirection = 1
-    } else if (lineOpacity >= 0.8) {
-      lineOpacity = 0.8
-      lineDirection = -1
-    }
-    if (messageLine && messageLine.setOptions) {
-      messageLine.setOptions({ strokeOpacity: lineOpacity })
-    }
-  }, 100)
-  
-  // 清理动画
-  const duration = 2500
-  setTimeout(() => {
-    clearInterval(lineInterval)
-    
-    // 淡出效果
-    let fadeOpacity = 0.8
-    const fadeInterval = setInterval(() => {
-      fadeOpacity -= 0.1
-      if (fadeOpacity <= 0) {
-        clearInterval(fadeInterval)
-        messageLine.setMap(null)
-        glowLine.setMap(null)
-      } else {
-        messageLine.setOptions({ strokeOpacity: fadeOpacity })
-        glowLine.setOptions({ strokeOpacity: fadeOpacity * 0.3 })
-      }
-    }, 50)
-  }, duration)
-}
-
-// 创建单个粒子
-function createParticle(fromCity, toCity, color, glowColor, index, total) {
-  if (!window.AMap || !mapInstance.value) return
-  
-  const size = 14 - index * 2 // 粒子大小递减
-  
-  // 创建粒子标记
-  const particleMarker = new window.AMap.Marker({
-    position: new window.AMap.LngLat(Number(fromCity.lng), Number(fromCity.lat)),
-    content: `
-      <div class="message-particle" style="
-        width: ${size}px;
-        height: ${size}px;
-        background: ${color};
-        border: 2px solid white;
-        border-radius: 50%;
-        box-shadow: 0 0 20px ${glowColor}, 0 0 40px ${glowColor};
-        position: relative;
-      ">
-        <div style="
-          position: absolute;
-          inset: -4px;
-          border-radius: 50%;
-          background: ${glowColor};
-          filter: blur(6px);
-          animation: particle-pulse 0.8s ease-in-out infinite;
-          animation-delay: ${index * 0.15}s;
-        "></div>
-      </div>
-    `,
-    offset: new window.AMap.Pixel(-size/2, -size/2),
-    zIndex: 102 - index
-  })
-  
-  particleMarker.setMap(mapInstance.value)
-  
-  // 创建拖尾效果标记
-  const trailMarker = new window.AMap.Marker({
-    position: new window.AMap.LngLat(Number(fromCity.lng), Number(fromCity.lat)),
-    content: `
-      <div style="
-        width: ${size * 3}px;
-        height: ${size}px;
-        background: linear-gradient(90deg, transparent, ${glowColor}, transparent);
-        border-radius: ${size}px;
-        filter: blur(4px);
-        opacity: 0.6;
-      "></div>
-    `,
-    offset: new window.AMap.Pixel(-size * 1.5, -size/2),
-    zIndex: 101 - index
-  })
-  
-  trailMarker.setMap(mapInstance.value)
-  
-  // 粒子移动动画（使用 easeInOutCubic 缓动）
-  const duration = 2000
-  const startTime = Date.now()
-  
-  function easeInOutCubic(t) {
-    return t < 0.5 
-      ? 4 * t * t * t 
-      : 1 - Math.pow(-2 * t + 2, 3) / 2
-  }
-  
-  function moveParticle() {
-    const elapsed = Date.now() - startTime
-    let progress = Math.min(elapsed / duration, 1)
-    
-    // 应用缓动函数
-    progress = easeInOutCubic(progress)
-    
-    // 计算当前位置
-    const currentLng = fromCity.lng + (toCity.lng - fromCity.lng) * progress
-    const currentLat = fromCity.lat + (toCity.lat - fromCity.lat) * progress
-    
-    particleMarker.setPosition(new window.AMap.LngLat(Number(currentLng), Number(currentLat)))
-    
-    // 拖尾稍微滞后
-    const trailProgress = Math.max(0, progress - 0.05)
-    const trailLng = fromCity.lng + (toCity.lng - fromCity.lng) * trailProgress
-    const trailLat = fromCity.lat + (toCity.lat - fromCity.lat) * trailProgress
-    trailMarker.setPosition(new window.AMap.LngLat(Number(trailLng), Number(trailLat)))
-    
-    if (progress < 1) {
-      requestAnimationFrame(moveParticle)
-    } else {
-      // 到达目标，添加爆炸效果
-      createArrivalEffect(toCity, color, glowColor)
-      
-      // 淡出粒子
-      setTimeout(() => {
-        particleMarker.setMap(null)
-        trailMarker.setMap(null)
-      }, 300)
-    }
-  }
-  
-  moveParticle()
-}
-
-// 创建到达爆炸效果
-function createArrivalEffect(city, color, glowColor) {
-  if (!window.AMap || !mapInstance.value) return
-  
-  const effectMarker = new window.AMap.Marker({
-    position: new window.AMap.LngLat(Number(city.lng), Number(city.lat)),
-    content: `
-      <div style="
-        width: 40px;
-        height: 40px;
-        border: 3px solid ${color};
-        border-radius: 50%;
-        box-shadow: 0 0 30px ${glowColor};
-        animation: arrival-burst 0.6s ease-out;
-      "></div>
-    `,
-    offset: new window.AMap.Pixel(-20, -20),
-    zIndex: 103
-  })
-  
-  effectMarker.setMap(mapInstance.value)
-  
-  // 移除效果
-  setTimeout(() => {
-    effectMarker.setMap(null)
-  }, 600)
-}
-
-// 格式化时间
-function formatTime(timestamp) {
-  return new Date(timestamp).toLocaleTimeString()
-}
-
-// 触发统计动画
-const statAnimationTrigger = ref(0)
-function triggerStatAnimation() {
-  statAnimationTrigger.value++
-}
-
-// 清空消息记录
+/**
+ * 清空消息记录
+ */
 function clearMessages() {
   recentMessages.value = []
   statistics.value = {
@@ -1005,32 +331,16 @@ function clearMessages() {
   }
 }
 
-// 注释掉 watch 监听器，改为手动控制重绘时机
-// 问题：watch 的 deep:true 会导致频繁触发，而且可能在不适当的时候清空线条
-// watch(edges, (newEdges, oldEdges) => {
-//   console.log('📊 edges 发生变化:', {
-//     旧边数: oldEdges?.length || 0,
-//     新边数: newEdges?.length || 0
-//   })
-//   
-//   // 只有在地图已初始化的情况下才重绘
-//   if (mapInstance.value && newEdges && newEdges.length > 0) {
-//     console.log('🔄 重新绘制 MST 线条...')
-//     drawMSTLines()
-//   }
-// }, { deep: true })
-
 // 组件挂载
 onMounted(() => {
   isComponentMounted = true
-  reconnectAttempts = 0
   initMap()
 })
 
 // 组件卸载
 onUnmounted(() => {
   console.log('[监控] 组件卸载，清理资源...')
-  isComponentMounted = false  // 标记组件已卸载
+  isComponentMounted = false
   
   // 清理定时器
   if (refreshTimer) {
@@ -1038,24 +348,18 @@ onUnmounted(() => {
     refreshTimer = null
   }
   
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
+  // 断开 WebSocket
+  disconnectWebSocket()
+  
+  // 清理地图和动画
+  if (messageAnimator) {
+    messageAnimator.clearAll()
+    messageAnimator = null
   }
   
-  // 清理 WebSocket 连接
-  if (monitorWs) {
-    // 先移除事件处理器，防止触发重连
-    monitorWs.onclose = null
-    monitorWs.onerror = null
-    monitorWs.onmessage = null
-    monitorWs.onopen = null
-    
-    // 关闭连接
-    if (monitorWs.readyState === WebSocket.OPEN || monitorWs.readyState === WebSocket.CONNECTING) {
-      monitorWs.close()
-    }
-    monitorWs = null
+  if (mapManager) {
+    mapManager.destroy()
+    mapManager = null
   }
   
   console.log('[监控] ✅ 资源清理完成')
@@ -1121,83 +425,26 @@ onUnmounted(() => {
         <div ref="mapEl" class="map-container"></div>
         
         <!-- 地图上的统计面板 -->
-        <div class="map-overlay-stats">
-          <div class="stat-card">
-            <div class="stat-value" :key="`online-${statistics.onlineCitiesCount}`">
-              {{ statistics.onlineCitiesCount }}
-            </div>
-            <div class="stat-label">在线城市</div>
-          </div>
-          <div class="stat-card" :class="{ 'stat-pulse': statAnimationTrigger > 0 }">
-            <div class="stat-value" :key="`total-${statistics.totalMessages}`">
-              {{ statistics.totalMessages }}
-            </div>
-            <div class="stat-label">总消息数</div>
-          </div>
-          <div class="stat-card encrypted" :class="{ 'stat-pulse': statAnimationTrigger > 0 }">
-            <div class="stat-value" :key="`encrypted-${statistics.encryptedMessages}`">
-              {{ statistics.encryptedMessages }}
-            </div>
-            <div class="stat-label">端到端通讯</div>
-          </div>
-        </div>
+        <MapStatsPanel 
+          :statistics="statistics" 
+          :animation-trigger="statAnimationTrigger"
+        />
       </div>
 
       <!-- 右侧信息面板 -->
       <aside class="info-panel">
         <!-- 在线城市列表 -->
-        <div class="panel-section">
-          <h3>📍 在线城市 ({{ onlineCities.length }})</h3>
-          <div class="online-cities-list">
-            <div 
-              v-for="city in onlineCities" 
-              :key="city"
-              class="online-city-item"
-              :class="{ selected: selectedCity?.name === city }"
-              @click="selectedCity = cities.find(c => c.name === city)"
-            >
-              <span class="online-dot"></span>
-              {{ city }}
-            </div>
-            <div v-if="!onlineCities.length" class="empty-state">
-              暂无在线城市
-            </div>
-          </div>
-        </div>
+        <OnlineCitiesList 
+          :online-cities="onlineCities"
+          :selected-city="selectedCity"
+          @select-city="handleCitySelect"
+        />
 
         <!-- 实时消息流 -->
-        <div class="panel-section messages-section">
-          <div class="section-header">
-            <h3>💬 实时消息流</h3>
-            <button @click="clearMessages" class="clear-btn">清空</button>
-          </div>
-          <div class="messages-list">
-            <transition-group name="message-list">
-              <div 
-                v-for="msg in recentMessages" 
-                :key="msg.id"
-                class="message-item"
-                :class="{ 
-                  encrypted: msg.type === 'encrypted',
-                  'new-message': msg.isNew
-                }"
-              >
-                <div class="message-header">
-                  <span class="message-type">
-                    {{ msg.type === 'encrypted' ? '🔐' : '📨' }}
-                  </span>
-                  <span class="message-route">{{ msg.from }} → {{ msg.to }}</span>
-                  <span class="message-time">{{ msg.timestamp }}</span>
-                </div>
-                <div class="message-content">{{ msg.content }}</div>
-                <div v-if="msg.isNew" class="new-indicator"></div>
-              </div>
-            </transition-group>
-            <div v-if="!recentMessages.length" class="empty-state">
-              暂无消息记录
-            </div>
-          </div>
-        </div>
+        <MessageStreamList 
+          :messages="recentMessages"
+          @clear-messages="clearMessages"
+        />
       </aside>
     </div>
   </div>
@@ -1407,66 +654,6 @@ onUnmounted(() => {
   color: #dc2626;
 }
 
-.map-overlay-stats {
-  position: absolute;
-  top: 16px;
-  left: 16px;
-  display: flex;
-  gap: 10px;
-  pointer-events: none;
-}
-
-.stat-card {
-  background: rgba(255, 255, 255, 0.95);
-  padding: 12px 16px;
-  border-radius: 10px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-  backdrop-filter: blur(10px);
-  min-width: 90px;
-  text-align: center;
-  transition: all 0.3s ease;
-}
-
-.stat-card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.15);
-}
-
-.stat-card.stat-pulse {
-  animation: stat-card-pulse 0.6s ease-out;
-}
-
-.stat-card.encrypted {
-  background: linear-gradient(135deg, rgba(139, 92, 246, 0.95) 0%, rgba(124, 58, 237, 0.95) 100%);
-  color: white;
-}
-
-.stat-value {
-  font-size: 24px;
-  font-weight: 700;
-  color: #0ea5e9;
-  margin-bottom: 2px;
-  transition: all 0.3s ease;
-}
-
-.stat-card .stat-value {
-  animation: stat-number-pop 0.4s ease-out;
-}
-
-.stat-card.encrypted .stat-value {
-  color: white;
-}
-
-.stat-label {
-  font-size: 11px;
-  color: #64748b;
-  font-weight: 500;
-}
-
-.stat-card.encrypted .stat-label {
-  color: rgba(255, 255, 255, 0.9);
-}
-
 .info-panel {
   display: flex;
   flex-direction: column;
@@ -1474,219 +661,7 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
-.panel-section {
-  background: white;
-  border: 1px solid #e5e7eb;
-  border-radius: 12px;
-  padding: 12px;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-
-.panel-section h3 {
-  margin: 0 0 10px 0;
-  font-size: 14px;
-  color: #1e293b;
-  font-weight: 600;
-}
-
-.section-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 10px;
-}
-
-.section-header h3 {
-  margin: 0;
-}
-
-.clear-btn {
-  padding: 4px 12px;
-  font-size: 12px;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
-  background: white;
-  color: #64748b;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.clear-btn:hover {
-  background: #fee2e2;
-  border-color: #fca5a5;
-  color: #dc2626;
-}
-
-.online-cities-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-height: 180px;
-  overflow-y: auto;
-}
-
-.online-city-item {
-  padding: 6px 10px;
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
-  border-radius: 6px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-  transition: all 0.2s;
-  font-size: 13px;
-  color: #15803d;
-}
-
-.online-city-item:hover {
-  background: #dcfce7;
-  transform: translateX(4px);
-}
-
-.online-city-item.selected {
-  background: #22c55e;
-  color: white;
-  border-color: #16a34a;
-}
-
-.online-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #22c55e;
-  animation: pulse 2s infinite;
-}
-
-.online-city-item.selected .online-dot {
-  background: white;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
-.messages-section {
-  flex: 1;
-  min-height: 0;
-}
-
-.messages-list {
-  flex: 1;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.message-item {
-  padding: 10px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  border-left: 3px solid #0ea5e9;
-  transition: all 0.3s ease;
-  position: relative;
-  overflow: hidden;
-}
-
-.message-item:hover {
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-  transform: translateX(2px);
-}
-
-.message-item.encrypted {
-  background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%);
-  border-left-color: #8b5cf6;
-}
-
-.message-item.new-message {
-  animation: message-enter 0.5s ease-out;
-  box-shadow: 0 4px 16px rgba(14, 165, 233, 0.3);
-}
-
-.message-item.encrypted.new-message {
-  box-shadow: 0 4px 16px rgba(139, 92, 246, 0.3);
-}
-
-.new-indicator {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, #0ea5e9, transparent);
-  animation: indicator-slide 0.5s ease-out;
-}
-
-.message-item.encrypted .new-indicator {
-  background: linear-gradient(90deg, transparent, #8b5cf6, transparent);
-}
-
-.message-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 4px;
-  font-size: 12px;
-}
-
-.message-type {
-  font-size: 14px;
-}
-
-.message-route {
-  flex: 1;
-  font-weight: 600;
-  color: #334155;
-}
-
-.message-time {
-  color: #94a3b8;
-  font-size: 10px;
-}
-
-.message-content {
-  font-size: 12px;
-  color: #64748b;
-  line-height: 1.4;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.empty-state {
-  padding: 40px 20px;
-  text-align: center;
-  color: #94a3b8;
-  font-size: 13px;
-}
-
-/* 添加CSS动画 */
-@keyframes pulse-dot {
-  0%, 100% {
-    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
-  }
-  50% {
-    box-shadow: 0 0 0 6px rgba(34, 197, 94, 0);
-  }
-}
-
-@keyframes pulse-message {
-  0%, 100% {
-    transform: scale(1);
-    opacity: 1;
-  }
-  50% {
-    transform: scale(1.3);
-    opacity: 0.8;
-  }
-}
-
-/* 在线城市标记脉冲动画 */
+/* 全局动画 - 在线城市标记脉冲 */
 :global(.pulse-marker) {
   animation: pulse-marker 2s ease-in-out infinite;
 }
@@ -1700,7 +675,7 @@ onUnmounted(() => {
   }
 }
 
-/* 粒子脉冲动画 */
+/* 粒子动画 */
 :global(.message-particle) {
   animation: particle-float 0.8s ease-in-out infinite;
 }
@@ -1714,7 +689,7 @@ onUnmounted(() => {
   }
 }
 
-/* 粒子内部发光动画 */
+/* 粒子内部发光动画 - 全局 */
 @keyframes particle-pulse {
   0%, 100% {
     opacity: 0.6;
@@ -1726,7 +701,7 @@ onUnmounted(() => {
   }
 }
 
-/* 到达爆炸效果 */
+/* 到达爆炸效果 - 全局 */
 @keyframes arrival-burst {
   0% {
     transform: scale(0.5);
@@ -1739,82 +714,6 @@ onUnmounted(() => {
   100% {
     transform: scale(2);
     opacity: 0;
-  }
-}
-
-/* 消息进入动画 */
-@keyframes message-enter {
-  0% {
-    opacity: 0;
-    transform: translateX(-30px) scale(0.9);
-  }
-  50% {
-    transform: translateX(5px) scale(1.02);
-  }
-  100% {
-    opacity: 1;
-    transform: translateX(0) scale(1);
-  }
-}
-
-/* 新消息指示器动画 */
-@keyframes indicator-slide {
-  0% {
-    transform: translateX(-100%);
-    opacity: 0;
-  }
-  50% {
-    opacity: 1;
-  }
-  100% {
-    transform: translateX(100%);
-    opacity: 0;
-  }
-}
-
-/* Vue 过渡动画 */
-.message-list-enter-active {
-  animation: message-enter 0.5s ease-out;
-}
-
-.message-list-leave-active {
-  transition: all 0.3s ease;
-}
-
-.message-list-leave-to {
-  opacity: 0;
-  transform: translateX(30px);
-}
-
-.message-list-move {
-  transition: transform 0.3s ease;
-}
-
-/* 统计卡片动画 */
-@keyframes stat-card-pulse {
-  0%, 100% {
-    transform: scale(1);
-  }
-  30% {
-    transform: scale(1.08);
-  }
-  60% {
-    transform: scale(0.98);
-  }
-}
-
-@keyframes stat-number-pop {
-  0% {
-    transform: scale(1);
-  }
-  40% {
-    transform: scale(1.3);
-  }
-  70% {
-    transform: scale(0.95);
-  }
-  100% {
-    transform: scale(1);
   }
 }
 
@@ -1849,28 +748,5 @@ onUnmounted(() => {
   75% {
     transform: translateX(2px);
   }
-}
-
-/* 滚动条样式 */
-.online-cities-list::-webkit-scrollbar,
-.messages-list::-webkit-scrollbar {
-  width: 6px;
-}
-
-.online-cities-list::-webkit-scrollbar-track,
-.messages-list::-webkit-scrollbar-track {
-  background: #f1f5f9;
-  border-radius: 3px;
-}
-
-.online-cities-list::-webkit-scrollbar-thumb,
-.messages-list::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
-  border-radius: 3px;
-}
-
-.online-cities-list::-webkit-scrollbar-thumb:hover,
-.messages-list::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
 }
 </style>
