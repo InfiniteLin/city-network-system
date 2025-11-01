@@ -24,15 +24,15 @@ export class WebSocketManager {
     this.ws = null
     this.status = WS_STATUS.DISCONNECTED
     this.reconnectAttempts = 0
-    this.maxReconnectAttempts = options.maxReconnectAttempts || 5
+    this.maxReconnectAttempts = options.maxReconnectAttempts || 999  // 几乎无限重连
     this.reconnectTimer = null
     this.isManualClose = false
     
     // 心跳机制
     this.heartbeatInterval = null
     this.heartbeatTimeout = null
-    this.pingInterval = 30000  // 每30秒发送一次ping
-    this.pongTimeout = 10000   // 等待pong响应的超时时间
+    this.pingInterval = 20000  // 每20秒发送一次ping（更频繁）
+    this.pongTimeout = 30000   // 等待pong响应的超时时间（更宽松，不主动断开）
     
     // 事件处理器
     this.handlers = {
@@ -75,7 +75,13 @@ export class WebSocketManager {
         try {
           const data = JSON.parse(event.data)
           
-          // 处理心跳响应
+          // 处理服务器发来的 ping，立即回复 pong
+          if (data.type === 'ping') {
+            this.sendPong()
+            return
+          }
+          
+          // 处理服务器回复的 pong（响应客户端发送的 ping）
           if (data.type === 'pong') {
             this.handlePong()
             return
@@ -149,12 +155,25 @@ export class WebSocketManager {
   sendPing() {
     console.log(`[WebSocket] ${this.city} 发送 ping`)
     this.send({ type: 'ping', timestamp: Date.now() })
+
+    if (this.heartbeatTimeout) {
+      clearTimeout(this.heartbeatTimeout)
+      this.heartbeatTimeout = null
+    }
     
-    // 设置pong超时
+    // 设置pong超时，仅提示，不主动断开
     this.heartbeatTimeout = setTimeout(() => {
-      console.warn(`[WebSocket] ${this.city} pong 响应超时，主动关闭连接`)
-      this.ws.close()  // 关闭连接，触发重连
+      console.warn(`[WebSocket] ${this.city} pong 响应超时，保持连接继续等待`)
+      this.heartbeatTimeout = null
     }, this.pongTimeout)
+  }
+
+  /**
+   * 发送pong消息（响应服务器的ping）
+   */
+  sendPong() {
+    console.log(`[WebSocket] ${this.city} 收到服务器 ping，回复 pong`)
+    this.send({ type: 'pong', timestamp: Date.now() })
   }
 
   /**
@@ -177,8 +196,9 @@ export class WebSocketManager {
     }
     
     this.reconnectAttempts++
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 10000)
-    console.log(`[WebSocket] ${this.city} 将在 ${delay}ms 后尝试第 ${this.reconnectAttempts} 次重连`)
+    // 使用更短的重连延迟：从500ms开始，最多3秒
+    const delay = Math.min(500 * Math.pow(1.5, this.reconnectAttempts - 1), 3000)
+    console.log(`[WebSocket] ${this.city} 将在 ${delay.toFixed(0)}ms 后尝试第 ${this.reconnectAttempts} 次重连`)
     
     this.reconnectTimer = setTimeout(() => {
       if (!this.isManualClose) {

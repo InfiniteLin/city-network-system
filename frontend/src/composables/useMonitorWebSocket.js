@@ -5,7 +5,7 @@
 
 import { ref, onUnmounted } from 'vue'
 
-const MAX_RECONNECT_ATTEMPTS = 5
+const MAX_RECONNECT_ATTEMPTS = 999  // 几乎无限重连
 
 export function useMonitorWebSocket(callbacks = {}) {
   const wsStatus = ref('disconnected') // 'connecting', 'connected', 'disconnected', 'error'
@@ -60,6 +60,16 @@ export function useMonitorWebSocket(callbacks = {}) {
       monitorWs.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
+          
+          // 处理服务器发来的 ping，立即回复 pong
+          if (data.type === 'ping') {
+            console.log('[监控] 收到服务器 ping，回复 pong')
+            if (monitorWs && monitorWs.readyState === WebSocket.OPEN) {
+              monitorWs.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }))
+            }
+            return
+          }
+          
           console.log('[监控] 收到消息:', data)
           
           if (callbacks.onMessage) {
@@ -81,8 +91,9 @@ export function useMonitorWebSocket(callbacks = {}) {
         // 只有在组件仍然激活且未达到最大重连次数时才重连
         if (isActive && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
           reconnectAttempts++
-          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 10000)
-          console.log(`[监控] 将在 ${delay}ms 后尝试第 ${reconnectAttempts} 次重连...`)
+          // 使用更短的重连延迟：从500ms开始，最多3秒
+          const delay = Math.min(500 * Math.pow(1.5, reconnectAttempts - 1), 3000)
+          console.log(`[监控] 将在 ${delay.toFixed(0)}ms 后尝试第 ${reconnectAttempts} 次重连...`)
           
           reconnectTimer = setTimeout(() => {
             if (isActive) {

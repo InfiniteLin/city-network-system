@@ -12,6 +12,7 @@ City Network System API
 - 本文件定位为“应用装配”与“对外网关”，尽量保持无业务逻辑，只做装配、配置与简单只读查询。
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,9 +26,23 @@ from routing import routing_manager
 # 引入分散在其他模块的业务路由集合，主程序只负责统一挂载，保持关注点分离。
 from routes import router
 
+# ========== 应用生命周期管理 ==========
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理（启动和关闭）"""
+    # 启动时初始化
+    from connection_manager import _ensure_log_task
+    _ensure_log_task()
+    print("✅ 异步日志系统已启动")
+    
+    yield
+    
+    # 关闭时清理（如果需要）
+    print("🔌 应用正在关闭...")
+
 # 创建 FastAPI 应用实例。
 # - title 会出现在自动生成的交互式文档（/docs, /redoc）中，便于识别服务。
-app = FastAPI(title="City Network System API")
+app = FastAPI(title="City Network System API", lifespan=lifespan)
 
 # ========== CORS（跨域资源共享）配置 ==========
 # 为什么需要 CORS：

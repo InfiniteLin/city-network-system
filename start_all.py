@@ -41,12 +41,11 @@ def start_backend():
         backend_dir = SCRIPT_DIR / 'backend'
         cmd = [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
         
+        # 不重定向输出，让后端输出直接显示在控制台，避免管道阻塞
         proc = subprocess.Popen(
             cmd,
             cwd=str(backend_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            # stdout 和 stderr 不重定向，直接输出到终端
         )
         processes.append(proc)
         print(f"     OK - 后端进程已启动，PID: {proc.pid}")
@@ -80,14 +79,12 @@ def start_frontend():
         frontend_dir = SCRIPT_DIR / 'frontend'
         
         # Windows 下使用 shell=True 以便正确识别 npm 命令
+        # 不重定向输出，让前端输出直接显示在控制台，避免管道阻塞
         if sys.platform.startswith('win'):
             cmd = "npm run dev"
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(frontend_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
                 shell=True,
             )
         else:
@@ -95,9 +92,6 @@ def start_frontend():
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(frontend_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
             )
         
         processes.append(proc)

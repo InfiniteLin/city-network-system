@@ -4,6 +4,7 @@ WebSocket连接管理器
 """
 import json
 import asyncio
+import time
 from typing import Dict, List
 from fastapi import WebSocket
 from routing import routing_manager
@@ -14,15 +15,84 @@ from pathlib import Path
 # 启用日志输出
 DEBUG_LOG_FILE = Path(__file__).parent.parent / "backend_debug.log"
 
-def debug_log(message: str):
-    """写入调试日志（非阻塞）"""
+# 创建一个日志队列用于异步写入
+_log_queue = asyncio.Queue()
+_log_task = None
+
+async def _log_writer():
+    """后台日志写入任务"""
     try:
-        import sys
-        # 只写文件，不输出到 stderr（避免阻塞）
-        with open(DEBUG_LOG_FILE, "a", encoding="utf-8", buffering=1) as f:  # 行缓冲
-            f.write(f"[{asyncio.get_event_loop().time():.2f}] {message}\n")
+        # 批量写入日志，减少IO操作
+        batch = []
+        last_write_time = asyncio.get_event_loop().time()
+        
+        while True:
+            try:
+                # 等待日志消息，但每0.5秒强制写入一次
+                timeout = 0.5 - (asyncio.get_event_loop().time() - last_write_time)
+                if timeout > 0:
+                    message = await asyncio.wait_for(_log_queue.get(), timeout=timeout)
+                    batch.append(message)
+                else:
+                    message = None
+            except asyncio.TimeoutError:
+                message = None
+            
+            # 收集更多消息（非阻塞）
+            while not _log_queue.empty() and len(batch) < 100:
+                try:
+                    batch.append(_log_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            
+            # 批量写入文件
+            if batch:
+                try:
+                    with open(DEBUG_LOG_FILE, "a", encoding="utf-8", buffering=8192) as f:
+                        f.writelines(batch)
+                    batch.clear()
+                    last_write_time = asyncio.get_event_loop().time()
+                except Exception:
+                    pass  # 静默失败
+            
+            # 如果没有消息且队列为空，短暂休眠
+            if message is None and _log_queue.empty():
+                await asyncio.sleep(0.1)
+                
+    except asyncio.CancelledError:
+        # 清理剩余日志
+        if batch:
+            try:
+                with open(DEBUG_LOG_FILE, "a", encoding="utf-8", buffering=8192) as f:
+                    f.writelines(batch)
+            except Exception:
+                pass
+
+def _ensure_log_task():
+    """确保日志写入任务正在运行"""
+    global _log_task
+    if _log_task is None or _log_task.done():
+        try:
+            loop = asyncio.get_event_loop()
+            _log_task = loop.create_task(_log_writer())
+        except RuntimeError:
+            # 事件循环未运行，忽略
+            pass
+
+def debug_log(message: str):
+    """写入调试日志（真正的非阻塞）"""
+    try:
+        timestamp = asyncio.get_event_loop().time()
+        formatted_message = f"[{timestamp:.2f}] {message}\n"
+        _ensure_log_task()
+        # 非阻塞地放入队列
+        try:
+            _log_queue.put_nowait(formatted_message)
+        except asyncio.QueueFull:
+            # 队列满了就丢弃，不阻塞
+            pass
     except Exception:
-        # 静默失败，不影响主流程
+        # 完全静默失败，不影响主流程
         pass
 
 
@@ -32,6 +102,9 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
         self.city_connections: Dict[str, List[WebSocket]] = {}
+        # 心跳保活任务：key 使用 websocket 实例 id，value 为 asyncio.Task
+        self.keepalive_tasks: Dict[int, asyncio.Task] = {}
+        self.keepalive_interval = 15  # 秒，更频繁的心跳以保持连接活跃
 
     async def connect(self, websocket: WebSocket, city: str):
         """建立WebSocket连接"""
@@ -68,6 +141,9 @@ class ConnectionManager:
         else:
             debug_log(f"[connect] Monitor_Admin 连接，跳过广播")
 
+        # 启动服务器侧的心跳保活，避免长时间无数据被中间件断开
+        self._start_keepalive(city, websocket)
+
     def disconnect(self, city: str, websocket: WebSocket):
         """断开WebSocket连接 - 只断开指定的 websocket 实例"""
         debug_log(f"[disconnect] 断开城市 {city} 的连接")
@@ -88,47 +164,52 @@ class ConnectionManager:
                 del self.city_connections[city]
                 debug_log(f"[disconnect] 清空 {city} 的 city_connections")
         
+        # 停止心跳任务
+        self._stop_keepalive(websocket)
+
         debug_log(f"[disconnect] 断开完成，剩余活跃连接: {len(self.active_connections)}")
         debug_log(f"[disconnect] 剩余城市列表: {list(self.active_connections.keys())}")
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
-        """发送个人消息"""
+        """发送个人消息（无超时限制）"""
         try:
-            await asyncio.wait_for(
-                websocket.send_text(message),
-                timeout=1.0
-            )
-        except asyncio.TimeoutError:
-            debug_log(f"[send_personal_message] 发送超时")
+            await websocket.send_text(message)
         except Exception as e:
             debug_log(f"[send_personal_message] 发送失败: {e}")
 
     async def broadcast_message(self, message: dict):
-        """广播消息给所有连接的客户端"""
+        """广播消息给所有连接的客户端（并行发送，非阻塞）"""
         # 创建副本避免在迭代时修改字典
-        disconnected_cities = []
-        for city, websocket in list(self.active_connections.items()):
+        connections = list(self.active_connections.items())
+        if not connections:
+            return
+        
+        message_json = json.dumps(message)
+        
+        # 并行发送消息给所有连接
+        async def send_to_one(city, websocket):
             try:
-                # 添加超时保护，避免阻塞
-                await asyncio.wait_for(
-                    websocket.send_text(json.dumps(message)),
-                    timeout=0.5  # 500ms 超时
-                )
-            except asyncio.TimeoutError:
-                debug_log(f"[broadcast_message] 发送到 {city} 超时")
-                disconnected_cities.append((city, websocket))
+                await websocket.send_text(message_json)
+                return None  # 成功
             except Exception as e:
-                # 连接已断开，记录需要移除的城市
                 error_msg = str(e)
                 debug_log(f"[broadcast_message] 发送到 {city} 失败: {error_msg}")
-                
-                # 只有在明确是连接断开的情况下才移除连接
-                # 避免因为临时错误误杀正常连接
+                # 只有在明确是连接断开的情况下才标记为断开
                 if any(keyword in error_msg.lower() for keyword in ['closed', 'disconnect', 'connection', 'reset']):
-                    disconnected_cities.append((city, websocket))
                     debug_log(f"[broadcast_message] {city} 被标记为断开")
+                    return (city, websocket)  # 需要断开
                 else:
-                    debug_log(f"[broadcast_message] {city} 发送失败但不确定是否断开，保留连接")
+                    debug_log(f"[broadcast_message] {city} 发送失败但可能是临时错误，保留连接")
+                    return None
+        
+        # 并行执行所有发送操作
+        results = await asyncio.gather(
+            *[send_to_one(city, ws) for city, ws in connections],
+            return_exceptions=True
+        )
+        
+        # 收集需要断开的连接
+        disconnected_cities = [r for r in results if r is not None and not isinstance(r, Exception)]
         
         # 在遍历完成后再移除断开的连接
         for city, websocket in disconnected_cities:
@@ -136,7 +217,6 @@ class ConnectionManager:
     
     async def send_encrypted_message(self, from_city: str, to_city: str, message: str):
         """发送加密消息，按照MST路由传递"""
-        import time
         start_time = time.time()
         
         try:
@@ -151,13 +231,10 @@ class ConnectionManager:
                 # 直接向发送者发送错误通知（按 city 名查找 websocket）
                 try:
                     if from_city in self.active_connections:
-                        await asyncio.wait_for(
-                            self.active_connections[from_city].send_text(json.dumps({
-                                "type": "error",
-                                "message": error_msg
-                            })),
-                            timeout=0.5
-                        )
+                        await self.active_connections[from_city].send_text(json.dumps({
+                            "type": "error",
+                            "message": error_msg
+                        }))
                 except Exception as _:
                     debug_log(f"WARN: 向 {from_city} 发送拓扑未加载错误失败")
                 return  # 返回而不是抛出异常
@@ -173,13 +250,10 @@ class ConnectionManager:
                 debug_log(f"ERROR: {error_msg}")
                 try:
                     if from_city in self.active_connections:
-                        await asyncio.wait_for(
-                            self.active_connections[from_city].send_text(json.dumps({
-                                "type": "error",
-                                "message": error_msg
-                            })),
-                            timeout=0.5
-                        )
+                        await self.active_connections[from_city].send_text(json.dumps({
+                            "type": "error",
+                            "message": error_msg
+                        }))
                 except Exception:
                     debug_log(f"WARN: 向 {from_city} 发送找不到路径错误失败")
                 return  # 返回而不是抛出异常
@@ -233,26 +307,18 @@ class ConnectionManager:
                 debug_log(f"  huffman_codes 内容: {huffman_codes}")
                 raise
             
-            # 5. 按照路由发送消息给所有经过的城市
+            # 5. 并行发送消息给路由上的所有城市
             debug_log(f"开始发送消息给路由上的城市...")
-            failed_cities = []
-            success_count = 0
             
-            for city in route:
-                debug_log(f"  [循环] 处理城市: {city}")
+            async def send_to_city(city):
+                """向单个城市发送消息"""
+                debug_log(f"  [并行] 处理城市: {city}")
                 if city in self.active_connections:
                     try:
                         debug_log(f"  发送给: {city} - 准备发送")
-                        # 添加超时保护，避免 WebSocket send_text 阻塞
-                        await asyncio.wait_for(
-                            self.active_connections[city].send_text(message_json),
-                            timeout=1.0  # 1秒超时
-                        )
-                        success_count += 1
+                        await self.active_connections[city].send_text(message_json)
                         debug_log(f"  ✅ 发送成功: {city}")
-                    except asyncio.TimeoutError:
-                        debug_log(f"  ❌ 发送超时: {city}")
-                        failed_cities.append((city, self.active_connections[city]))
+                        return (True, city, None)  # 成功
                     except Exception as e:
                         error_msg = str(e)
                         debug_log(f"  ❌ 发送失败: {error_msg}")
@@ -260,16 +326,29 @@ class ConnectionManager:
                         # 只有在明确是连接问题时才断开
                         if any(keyword in error_msg.lower() for keyword in ['closed', 'disconnect', 'connection', 'reset']):
                             debug_log(f"  ⚠️ {city} 连接已断开，将移除")
-                            failed_cities.append((city, self.active_connections[city]))
+                            return (False, city, self.active_connections.get(city))  # 需要断开
                         else:
                             debug_log(f"  ⚠️ {city} 发送失败但可能是临时错误，保留连接")
+                            return (False, city, None)  # 失败但保留
                 else:
                     debug_log(f"  ⚠️ {city} 不在活跃连接中")
+                    return (False, city, None)
             
-            debug_log(f"[退出循环] 准备移除断开的连接")
+            # 并行发送给所有城市
+            results = await asyncio.gather(
+                *[send_to_city(city) for city in route],
+                return_exceptions=True
+            )
+            
+            # 统计结果
+            success_count = sum(1 for r in results if not isinstance(r, Exception) and r[0])
+            failed_cities = [(r[1], r[2]) for r in results if not isinstance(r, Exception) and r[2] is not None]
+            
+            debug_log(f"[并行发送完成] 准备移除断开的连接")
             # 移除确认断开的连接
             for city, websocket in failed_cities:
-                self.disconnect(city, websocket)
+                if websocket:  # 确保 websocket 不为 None
+                    self.disconnect(city, websocket)
             
             debug_log(f"发送完成: 成功 {success_count}/{len(route)} 个城市")
             debug_log(f"[发送完成后] 准备发送给 Monitor_Admin")
@@ -281,14 +360,8 @@ class ConnectionManager:
                 debug_log(f"  [Monitor_Admin] 准备发送")
                 try:
                     debug_log(f"  发送给监控管理员: Monitor_Admin")
-                    # 添加超时保护，避免 WebSocket send_text 阻塞
-                    await asyncio.wait_for(
-                        self.active_connections['Monitor_Admin'].send_text(message_json),
-                        timeout=0.5  # 500ms 超时
-                    )
+                    await self.active_connections['Monitor_Admin'].send_text(message_json)
                     debug_log(f"  ✅ 监控管理员接收成功")
-                except asyncio.TimeoutError:
-                    debug_log(f"  ❌ 监控管理员接收超时")
                 except Exception as e:
                     error_msg = str(e)
                     debug_log(f"  ❌ 监控管理员接收失败: {error_msg}")
@@ -325,13 +398,10 @@ class ConnectionManager:
             # 不重新抛出异常，改为记录并尝试通知发送者（如果可用），避免顶层断开或崩溃
             try:
                 if 'from_city' in locals() and from_city in self.active_connections:
-                    await asyncio.wait_for(
-                        self.active_connections[from_city].send_text(json.dumps({
-                            "type": "error",
-                            "message": f"发送消息失败: {str(e)}"
-                        })),
-                        timeout=0.5
-                    )
+                    await self.active_connections[from_city].send_text(json.dumps({
+                        "type": "error",
+                        "message": f"发送消息失败: {str(e)}"
+                    }))
             except Exception:
                 debug_log("WARN: 无法向发送者发送失败通知")
             return
@@ -387,12 +457,9 @@ class ConnectionManager:
                         "timestamp": encrypted_message["timestamp"]
                     }
                     try:
-                        await asyncio.wait_for(
-                            self.active_connections[to_city].send_text(json.dumps(decrypted_msg)),
-                            timeout=1.0
-                        )
-                    except asyncio.TimeoutError:
-                        debug_log(f"[decrypt_and_deliver_message] 发送给 {to_city} 超时")
+                        await self.active_connections[to_city].send_text(json.dumps(decrypted_msg))
+                    except Exception as send_error:
+                        debug_log(f"[decrypt_and_deliver_message] 发送给 {to_city} 失败: {send_error}")
                 
                 # ⚠️ 移除 broadcast_system_message 调用避免死锁
                 debug_log(f"[decrypt_and_deliver_message] ✅ {to_city} 成功接收来自 {from_city} 的加密消息")
@@ -404,12 +471,9 @@ class ConnectionManager:
                     next_city = route[current_index + 1]
                     if next_city in self.active_connections:
                         try:
-                            await asyncio.wait_for(
-                                self.active_connections[next_city].send_text(json.dumps(encrypted_message)),
-                                timeout=1.0
-                            )
-                        except asyncio.TimeoutError:
-                            debug_log(f"[decrypt_and_deliver_message] 转发到 {next_city} 超时")
+                            await self.active_connections[next_city].send_text(json.dumps(encrypted_message))
+                        except Exception as forward_error:
+                            debug_log(f"[decrypt_and_deliver_message] 转发到 {next_city} 失败: {forward_error}")
                     # ⚠️ 移除 broadcast_system_message 调用避免死锁
                     debug_log(f"[decrypt_and_deliver_message] 📡 {current_city} 转发消息 {from_city} -> {to_city} (下一跳: {next_city})")
                 
@@ -427,6 +491,48 @@ class ConnectionManager:
             "timestamp": asyncio.get_event_loop().time()
         }
         await self.broadcast_message(system_msg)
+
+    def _start_keepalive(self, city: str, websocket: WebSocket):
+        """启动服务器侧心跳，周期性推送 keepalive 消息防止连接闲置被断开"""
+        key = id(websocket)
+
+        async def _keepalive_loop():
+            debug_log(f"[keepalive] 启动 -> {city}")
+            try:
+                while True:
+                    await asyncio.sleep(self.keepalive_interval)
+                    # 如果连接已经被替换或断开，则停止心跳
+                    if city not in self.active_connections or self.active_connections.get(city) != websocket:
+                        debug_log(f"[keepalive] {city} 心跳结束（连接已更换或断开）")
+                        break
+
+                    debug_log(f"[keepalive] -> {city} 发送 ping")
+                    payload = json.dumps({
+                        "type": "ping",
+                        "source": "server_keepalive",
+                        "timestamp": time.time()
+                    })
+                    try:
+                        await websocket.send_text(payload)
+                    except Exception as send_error:
+                        debug_log(f"[keepalive] 向 {city} 发送心跳失败: {send_error}")
+                        break
+                    # 只发送 ping，等待客户端回复 pong（客户端会在收到 ping 后自动回复 pong）
+            except asyncio.CancelledError:
+                debug_log(f"[keepalive] {city} 心跳任务被取消")
+            finally:
+                self.keepalive_tasks.pop(key, None)
+
+        # 先停止旧任务，避免重复
+        self._stop_keepalive(websocket)
+        self.keepalive_tasks[key] = asyncio.create_task(_keepalive_loop())
+
+    def _stop_keepalive(self, websocket: WebSocket):
+        """停止指定连接的服务器侧心跳任务"""
+        key = id(websocket)
+        task = self.keepalive_tasks.pop(key, None)
+        if task:
+            task.cancel()
 
     def get_active_cities(self) -> List[str]:
         """获取当前活跃的城市列表（排除监控连接）"""

@@ -27,13 +27,10 @@ async def websocket_endpoint(websocket: WebSocket, city: str):
                 
                 # 处理心跳 ping 消息
                 if message_data.get("type") == "ping":
-                    # 立即响应 pong
+                    # 立即响应 pong（无超时限制）
                     pong_msg = {"type": "pong", "timestamp": message_data.get("timestamp")}
                     try:
-                        await asyncio.wait_for(
-                            websocket.send_text(json.dumps(pong_msg)),
-                            timeout=1.0
-                        )
+                        await websocket.send_text(json.dumps(pong_msg))
                         debug_log(f"[WebSocket] 💓 响应 pong 到 {city}")
                     except Exception as e:
                         debug_log(f"[WebSocket] ⚠️ 发送 pong 失败: {e}")
