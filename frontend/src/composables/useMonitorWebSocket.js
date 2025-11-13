@@ -6,6 +6,11 @@
 import { ref, onUnmounted } from 'vue'
 
 const MAX_RECONNECT_ATTEMPTS = 999  // 几乎无限重连
+const PING_INTERVAL = 25000 // 25秒
+const PONG_TIMEOUT = 10000 // 10秒
+const INITIAL_RECONNECT_DELAY = 500 // 500ms
+const MAX_RECONNECT_DELAY = 3000 // 3秒
+const RECONNECT_MULTIPLIER = 1.5 // 指数退避倍数
 
 export function useMonitorWebSocket(callbacks = {}) {
   const wsStatus = ref('disconnected') // 'connecting', 'connected', 'disconnected', 'error'
@@ -13,24 +18,43 @@ export function useMonitorWebSocket(callbacks = {}) {
   let monitorWs = null
   let reconnectAttempts = 0
   let reconnectTimer = null
+  let pingInterval = null
+  let pongTimeout = null
   let isActive = true
+  let lastPongTime = 0  // 记录最后收到消息的时间
 
   /**
    * 连接监控 WebSocket
    */
-  function connect() {
+  const connect = () => {
     if (!isActive) {
-      console.log('[监控] 组件未激活，跳过 WebSocket 连接')
+      console.log('[监控] 组件未激活，停止连接')
       return
     }
 
-    // 清理现有连接
     if (monitorWs) {
+      const state = monitorWs.readyState
+      if (state === WebSocket.OPEN) {
+        console.log('[监控] WebSocket 已连接，跳过')
+        wsStatus.value = 'connected'
+        return
+      }
+      if (state === WebSocket.CONNECTING) {
+        console.log('[监控] WebSocket 正在连接中，跳过')
+        wsStatus.value = 'connecting'
+        return
+      }
+      
+      // 清理已关闭的连接
+      console.log('[监控] 清理旧连接...')
       monitorWs.onclose = null
       monitorWs.onerror = null
       monitorWs.onmessage = null
-      if (monitorWs.readyState === WebSocket.OPEN || monitorWs.readyState === WebSocket.CONNECTING) {
+      monitorWs.onopen = null
+      try {
         monitorWs.close()
+      } catch (e) {
+        // 忽略关闭错误
       }
       monitorWs = null
     }
@@ -39,6 +63,16 @@ export function useMonitorWebSocket(callbacks = {}) {
     if (reconnectTimer) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
+    }
+
+    // 清理心跳定时器
+    if (pingInterval) {
+      clearInterval(pingInterval)
+      pingInterval = null
+    }
+    if (pongTimeout) {
+      clearTimeout(pongTimeout)
+      pongTimeout = null
     }
 
     try {
@@ -51,21 +85,40 @@ export function useMonitorWebSocket(callbacks = {}) {
         console.log('✅ [监控] WebSocket 连接成功建立')
         reconnectAttempts = 0
         wsStatus.value = 'connected'
+        lastPongTime = Date.now()  // 初始化时间
         
         if (callbacks.onConnected) {
           callbacks.onConnected()
         }
+
+        // 启动心跳 - 延迟启动，避免立即发送
+        setTimeout(() => {
+          startHeartbeat()
+        }, 1000)
       }
       
       monitorWs.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
           
+          // 更新最后收到消息的时间
+          lastPongTime = Date.now()
+          
           // 处理服务器发来的 ping，立即回复 pong
           if (data.type === 'ping') {
             console.log('[监控] 收到服务器 ping，回复 pong')
             if (monitorWs && monitorWs.readyState === WebSocket.OPEN) {
               monitorWs.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }))
+            }
+            return
+          }
+          
+          // 处理服务器的 pong 响应
+          if (data.type === 'pong') {
+            console.log('[监控] 收到 pong 响应')
+            if (pongTimeout) {
+              clearTimeout(pongTimeout)
+              pongTimeout = null
             }
             return
           }
@@ -88,18 +141,19 @@ export function useMonitorWebSocket(callbacks = {}) {
           callbacks.onDisconnected()
         }
         
+        // 清除定时器
+        if (pingInterval) {
+          clearInterval(pingInterval)
+          pingInterval = null
+        }
+        if (pongTimeout) {
+          clearTimeout(pongTimeout)
+          pongTimeout = null
+        }
+        
         // 只有在组件仍然激活且未达到最大重连次数时才重连
-        if (isActive && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          reconnectAttempts++
-          // 使用更短的重连延迟：从500ms开始，最多3秒
-          const delay = Math.min(500 * Math.pow(1.5, reconnectAttempts - 1), 3000)
-          console.log(`[监控] 将在 ${delay.toFixed(0)}ms 后尝试第 ${reconnectAttempts} 次重连...`)
-          
-          reconnectTimer = setTimeout(() => {
-            if (isActive) {
-              connect()
-            }
-          }, delay)
+        if (isActive && event.code !== 1000 && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          scheduleReconnect()
         } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
           console.warn('[监控] ⚠️ 已达到最大重连次数，停止重连')
           wsStatus.value = 'error'
@@ -126,6 +180,75 @@ export function useMonitorWebSocket(callbacks = {}) {
         callbacks.onError('创建 WebSocket 连接失败')
       }
     }
+  }
+
+  const startHeartbeat = () => {
+    // 清除旧的心跳
+    if (pingInterval) {
+      clearInterval(pingInterval)
+      pingInterval = null
+    }
+    if (pongTimeout) {
+      clearTimeout(pongTimeout)
+      pongTimeout = null
+    }
+    
+    console.log('[监控] 启动心跳机制')
+    
+    // 启动新的心跳
+    pingInterval = setInterval(() => {
+      if (monitorWs && monitorWs.readyState === WebSocket.OPEN) {
+        console.log('[监控] 发送 ping')
+        try {
+          monitorWs.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }))
+          
+          // 设置 pong 超时检测 - 但不关闭连接，只是记录警告
+          if (pongTimeout) {
+            clearTimeout(pongTimeout)
+          }
+          pongTimeout = setTimeout(() => {
+            console.warn('[监控] ⚠️ pong 响应超时，但保持连接')
+          }, PONG_TIMEOUT)
+        } catch (error) {
+          console.error('[监控] 发送 ping 失败:', error)
+        }
+      }
+    }, PING_INTERVAL)
+  }
+
+  const scheduleReconnect = () => {
+    // 清除旧的重连定时器
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    
+    if (!isActive) {
+      console.log('[监控] 组件已卸载，停止重连')
+      return
+    }
+    
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      console.log('[监控] 达到最大重连次数')
+      wsStatus.value = 'error'
+      return
+    }
+    
+    reconnectAttempts++
+    
+    const delay = Math.min(
+      INITIAL_RECONNECT_DELAY * Math.pow(RECONNECT_MULTIPLIER, reconnectAttempts - 1),
+      MAX_RECONNECT_DELAY
+    )
+    
+    console.log(`[监控] 将在 ${delay.toFixed(0)}ms 后尝试第 ${reconnectAttempts} 次重连...`)
+    
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      if (isActive) {
+        connect()
+      }
+    }, delay)
   }
 
   /**
